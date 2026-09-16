@@ -29,6 +29,11 @@ struct HuyaLine {
     }
 }
 
+struct HuyaQuality {
+    let name: String
+    let bitRate: Int
+}
+
 struct HuyaRoom {
     let roomId: String
     let nick: String
@@ -39,6 +44,17 @@ struct HuyaRoom {
     let topSid: Int
     let subSid: Int
     let lines: [HuyaLine]
+    let qualities: [HuyaQuality]
+
+    /// The lowest advertised bitrate, in kbps. Huya reports "流畅" as the smallest
+    /// positive `iBitRate`, so this is what the player pins the stream to.
+    var lowestQuality: HuyaQuality? {
+        return qualities.filter { $0.bitRate > 0 }.min { $0.bitRate < $1.bitRate }
+    }
+
+    var lowestBitRate: Int? {
+        return lowestQuality?.bitRate
+    }
 }
 
 struct SearchResult: Identifiable, Equatable {

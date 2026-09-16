@@ -8,9 +8,10 @@
 | --- | --- |
 | 房号查询房间信息 | `HuyaAPI.fetchRoom`，接口与原版一致（`mp.huya.com/cache.php`） |
 | 按主播名搜索 | `HuyaAPI.searchAnchors`（`search.cdn.huya.com`），开播的排前面并显示绿色 |
-| 弹幕（TARS 协议 WebSocket） | `Tars.swift` + `DanmakuClient.swift`，连接 `wss://cdnws.api.huya.com`，60 秒心跳，断线 2.5 秒自动重连 |
+| 弹幕（TARS 协议 WebSocket） | `Tars.swift` + `DanmakuClient.swift`，连接 `wss://cdnws.api.huya.com`，30 秒心跳，断线自动重连（单次重连 + 退避，最多 30 秒） |
 | 贵族弹幕颜色 | `DanmakuClient.parseChat` 读取颜色字段，`Color(hex:)` 渲染 |
 | 音频播放（原版 ffplay） | `AudioPlayer.swift` 使用 AVPlayer 播放 HLS 流 |
+| 省流量 | 自动读取虎牙画质列表 `rateArray`，固定使用最低画质「流畅」（如 500 kbps），并给 AVPlayer 设置 `preferredPeakBitRate` 上限，避免自动升到高码率 |
 | 音频直链过期自动续播 | 每 300 秒重新签名换链；播放失败/卡顿立即换线重连 |
 | 独立开关弹幕 / 音频 | 「弹幕」「音频」两个独立按钮 |
 | 历史房号 + 删除 | `RoomHistoryStore`，存到 App 沙盒 `Documents/history.json` |
@@ -32,8 +33,10 @@
 ## 技术说明
 
 - 原版播放的是 FLV 流，AVPlayer 不支持 FLV。iOS 版优先使用同房间的 **HLS（m3u8）** 地址，这也是 iOS 上能实现后台播放的前提。签名算法（`processAnticode`）与原版完全一致，只是把 `sFlvUrl` 换成了 `sHlsUrl`。若房间确实只提供 FLV，音频会连接失败并自动重试。
+- 画质由 `ratio` 参数决定，其取值就是画质列表里的 `iBitRate`。`ratio` 不参与 `wsSecret` 签名计算，所以修改它不会让链接失效。
 - 所有网络请求的 UA / Referer 与原版保持一致。
 - 弹幕 TARS 编解码为逐行移植，字段号、心跳包、URI 1400 均未改动。
+- 弹幕重连采用「单飞」模型：每次连接分配一个 token，所有异步回调都会校验 token，拆除连接时先递增 token 再取消任务。这样 `URLSession` 在取消时抛出的回调不会启动第二个重连链，避免重连风暴。断线后按 1.5 倍退避重连，收到任意数据即重置为 2.5 秒。
 
 ## 构建与安装
 

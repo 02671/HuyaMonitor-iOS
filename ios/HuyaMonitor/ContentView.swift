@@ -170,10 +170,24 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "waveform")
                         .foregroundColor(Theme.accent)
-                    Text("正在播放：\(viewModel.audioTitle)")
+                    Text(viewModel.audioQuality.isEmpty
+                         ? "正在播放：\(viewModel.audioTitle)"
+                         : "正在播放：\(viewModel.audioTitle)（\(viewModel.audioQuality)）")
                         .font(.system(size: 12))
                         .foregroundColor(Theme.muted)
                         .lineLimit(1)
+                    Spacer()
+                }
+            }
+
+            if !viewModel.danmakuDiagnostic.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundColor(Theme.danger)
+                    Text("弹幕诊断：\(viewModel.danmakuDiagnostic)")
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.muted)
+                        .lineLimit(2)
                     Spacer()
                 }
             }

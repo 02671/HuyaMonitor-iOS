@@ -6,6 +6,10 @@ enum HuyaAPI {
     static let mobileUA = "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36"
     static let playUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
+    /// Used when the room does not advertise its quality list. 2000 kbps ("超清") is
+    /// Huya's long-standing default and is known to work for every room.
+    static let defaultBitRate = 2000
+
     static var playbackHeaders: [String: String] {
         return [
             "User-Agent": playUA,
@@ -98,6 +102,7 @@ enum HuyaAPI {
         let live = payload["liveData"] as? [String: Any] ?? [:]
         let stream = payload["stream"] as? [String: Any] ?? [:]
         let rawLines = stream["baseSteamInfoList"] as? [[String: Any]] ?? []
+        let qualities = parseQualities(stream)
 
         let lines: [HuyaLine] = rawLines.map { item in
             let flvAntiCode = asString(item["sFlvAntiCode"])
@@ -132,8 +137,32 @@ enum HuyaAPI {
             uid: uid,
             topSid: topSid,
             subSid: subSid,
-            lines: lines
+            lines: lines,
+            qualities: qualities
         )
+    }
+
+    /// Huya exposes the selectable qualities as `rateArray` on the `hls` / `flv` objects,
+    /// e.g. [{"sDisplayName": "蓝光4M", "iBitRate": 4000}, ... {"sDisplayName": "流畅", "iBitRate": 500}].
+    /// Older responses used `vMultiStreamInfo` instead.
+    private static func parseQualities(_ stream: [String: Any]) -> [HuyaQuality] {
+        let sources: [[String: Any]] = [
+            stream["hls"] as? [String: Any] ?? [:],
+            stream["flv"] as? [String: Any] ?? [:],
+            stream,
+        ]
+        for source in sources {
+            let raw = (source["rateArray"] as? [[String: Any]])
+                ?? (source["vMultiStreamInfo"] as? [[String: Any]])
+                ?? []
+            let parsed = raw.compactMap { item -> HuyaQuality? in
+                let rate = asInt(item["iBitRate"])
+                guard rate > 0 else { return nil }
+                return HuyaQuality(name: asString(item["sDisplayName"]), bitRate: rate)
+            }
+            if !parsed.isEmpty { return parsed }
+        }
+        return []
     }
 
     // MARK: - Search
@@ -209,11 +238,12 @@ enum HuyaAPI {
         let uid = await anonymousUID()
         var lastError: Error = HuyaError.message("直播流签名失败")
         let count = lines.count
+        let ratio = room.lowestBitRate ?? defaultBitRate
 
         for offset in 0..<count {
             let index = (lineIndex + offset) % count
             do {
-                let url = try buildURL(line: lines[index], uid: uid)
+                let url = try buildURL(line: lines[index], uid: uid, ratio: ratio)
                 return (url, index)
             } catch {
                 lastError = error
@@ -222,9 +252,9 @@ enum HuyaAPI {
         throw lastError
     }
 
-    private static func buildURL(line: HuyaLine, uid: String) throws -> String {
+    private static func buildURL(line: HuyaLine, uid: String, ratio: Int) throws -> String {
         if line.hasHLS {
-            let params = processAnticode(line.hlsAntiCode, uid: uid, streamName: line.streamName)
+            let params = processAnticode(line.hlsAntiCode, uid: uid, streamName: line.streamName, ratio: ratio)
             let base = line.hlsURL.hasSuffix("/") ? String(line.hlsURL.dropLast()) : line.hlsURL
             let suffix = line.hlsSuffix.isEmpty ? "m3u8" : line.hlsSuffix
             return httpsify("\(base)/\(line.streamName).\(suffix)?\(params)")
@@ -232,14 +262,10 @@ enum HuyaAPI {
         guard line.hasFLV else {
             throw HuyaError.message("未拿到直播流地址")
         }
-        let params = processAnticode(line.flvAntiCode, uid: uid, streamName: line.streamName)
+        let params = processAnticode(line.flvAntiCode, uid: uid, streamName: line.streamName, ratio: ratio)
         let base = line.flvURL.hasSuffix("/") ? String(line.flvURL.dropLast()) : line.flvURL
         let suffix = line.flvSuffix.isEmpty ? "flv" : line.flvSuffix
-        var url = "\(base)/\(line.streamName).\(suffix)?\(params)"
-        if !url.contains("ratio=") {
-            url += "&ratio=2000"
-        }
-        return httpsify(url)
+        return httpsify("\(base)/\(line.streamName).\(suffix)?\(params)")
     }
 
     private static func httpsify(_ url: String) -> String {
@@ -251,7 +277,7 @@ enum HuyaAPI {
 
     // MARK: - Anticode signature
 
-    static func processAnticode(_ anticode: String, uid: String, streamName: String) -> String {
+    static func processAnticode(_ anticode: String, uid: String, streamName: String, ratio: Int) -> String {
         var items = parseQuery(anticode)
 
         func value(_ name: String) -> String {
@@ -263,6 +289,9 @@ enum HuyaAPI {
 
         set("ver", "1")
         set("sv", "2110211124")
+        // Pin the rendition to the requested bitrate. `ratio` is not part of the signed
+        // `fm` template, so setting it does not invalidate `wsSecret`.
+        set("ratio", String(ratio))
 
         let uidValue = Int(uid) ?? 0
         let now = Int(Date().timeIntervalSince1970 * 1000)

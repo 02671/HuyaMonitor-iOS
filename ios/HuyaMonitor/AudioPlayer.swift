@@ -106,6 +106,11 @@ final class AudioPlayer {
         let asset = AVURLAsset(url: url, options: options)
         let item = AVPlayerItem(asset: asset)
         item.preferredForwardBufferDuration = 2
+        // Belt and braces: `ratio` pins the CDN rendition, and this caps HLS variant
+        // selection so AVPlayer cannot quietly upgrade to a higher-bitrate rendition.
+        if let lowest = room.lowestBitRate, lowest > 0 {
+            item.preferredPeakBitRate = Double(lowest) * 1200
+        }
 
         if let player {
             player.replaceCurrentItem(with: item)

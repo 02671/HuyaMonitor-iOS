@@ -37,6 +37,8 @@ final class MonitorViewModel: ObservableObject {
     @Published var searching = false
     @Published var alertMessage: String?
     @Published var audioTitle = ""
+    @Published var audioQuality = ""
+    @Published var danmakuDiagnostic = ""
 
     private let danmaku = DanmakuClient()
     private let audio = AudioPlayer()
@@ -63,6 +65,12 @@ final class MonitorViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.danmuPhase = self.phase(of: text, ok: ok)
+                if ok { self.danmakuDiagnostic = "" }
+            }
+        }
+        danmaku.onDiagnostic = { [weak self] reason in
+            Task { @MainActor in
+                self?.danmakuDiagnostic = reason
             }
         }
         audio.onStatus = { [weak self] text, ok in
@@ -151,6 +159,7 @@ final class MonitorViewModel: ObservableObject {
             audioWanted = false
             audioPhase = .off
             audioTitle = ""
+            audioQuality = ""
             return
         }
         let roomId: String
@@ -182,6 +191,7 @@ final class MonitorViewModel: ObservableObject {
     private func startAudio(room: HuyaRoom) {
         audioWanted = true
         audioTitle = room.nick.isEmpty ? room.title : room.nick
+        audioQuality = room.lowestQuality?.name ?? ""
         audio.start(roomId: room.roomId)
         audio.setVolume(volume)
     }

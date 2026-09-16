@@ -10,16 +10,30 @@ final class DanmakuClient {
 
     var onMessage: ((_ user: String, _ text: String, _ color: String) -> Void)?
     var onStatus: ((_ text: String, _ ok: Bool) -> Void)?
+    /// Reason for the most recent disconnect, so the UI can show what actually failed.
+    var onDiagnostic: ((String) -> Void)?
+
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 20
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
 
     private var task: URLSessionWebSocketTask?
-    private var session: URLSession?
     private var heartbeatTimer: Timer?
-    private var generation = 0
-    private var wanted = false
+    private var reconnectItem: DispatchWorkItem?
 
+    /// Identifies the in-flight connection. Every asynchronous callback captures the token
+    /// it was created with and returns early once the token has moved on. Tearing a socket
+    /// down bumps the token *first*, so the cancellation callbacks that URLSession fires
+    /// can no longer start a competing reconnect chain.
+    private var token = 0
+    private var wanted = false
     private var ayyuid = 0
     private var topSid = 0
     private var subSid = 0
+    private var reconnectDelay: TimeInterval = 2.5
 
     var isConnected: Bool { task != nil }
     var isWanted: Bool { wanted }
@@ -32,109 +46,131 @@ final class DanmakuClient {
         self.topSid = topSid
         self.subSid = subSid
         wanted = true
-        generation += 1
-        onStatus?("弹幕连接中", false)
-        connect(generation: generation)
+        reconnectDelay = 2.5
+        openNewConnection()
     }
 
     func stop(notify: Bool = true) {
         wanted = false
-        generation += 1
-        teardownSocket()
+        token += 1
+        reconnectItem?.cancel()
+        reconnectItem = nil
+        teardown()
         if notify {
             onStatus?("弹幕未连接", false)
         }
     }
 
-    /// Called when the app returns to the foreground: reconnects if the socket died while suspended.
+    /// Called when the app returns to the foreground: reconnects if the socket died while
+    /// the app was suspended. Does nothing while a reconnect is already pending.
     func ensureConnected() {
-        guard wanted, task == nil else { return }
-        generation += 1
-        onStatus?("弹幕连接中", false)
-        connect(generation: generation)
+        guard wanted, task == nil, reconnectItem == nil else { return }
+        openNewConnection()
     }
 
-    // MARK: - Connection
+    // MARK: - Connection lifecycle
 
-    private func connect(generation gen: Int) {
-        guard wanted, gen == generation, let url = URL(string: danmakuWSURL) else { return }
+    private func openNewConnection() {
+        guard wanted else { return }
+        token += 1
+        let id = token
+        teardown()
+        onStatus?("弹幕连接中", false)
+        open(id)
+    }
+
+    private func open(_ id: Int) {
+        guard wanted, id == token, let url = URL(string: danmakuWSURL) else { return }
+
         var request = URLRequest(url: url)
         request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
 
-        let session = URLSession(configuration: .default)
         let task = session.webSocketTask(with: request)
-        self.session = session
         self.task = task
         task.resume()
 
         let join = DanmakuClient.buildJoin(ayyuid: ayyuid, tid: topSid, sid: subSid)
         task.send(.data(join)) { [weak self] error in
             Task { @MainActor in
-                guard let self, gen == self.generation, self.wanted else { return }
+                guard let self, self.wanted, id == self.token else { return }
                 if let error {
-                    self.handleDisconnect(generation: gen, error: error)
+                    self.fail(id: id, reason: error.localizedDescription)
                     return
                 }
                 self.onStatus?("弹幕已连接", true)
-                self.receive(generation: gen)
-                self.startHeartbeat(generation: gen)
+                self.receive(id)
+                self.startHeartbeat(id)
             }
         }
     }
 
-    private func receive(generation gen: Int) {
-        guard let task, gen == generation, wanted else { return }
+    private func receive(_ id: Int) {
+        guard wanted, id == token, let task else { return }
         task.receive { [weak self] result in
             Task { @MainActor in
-                guard let self, gen == self.generation, self.wanted else { return }
+                guard let self, self.wanted, id == self.token else { return }
                 switch result {
                 case .success(let message):
-                    if case .data(let data) = message, let chat = DanmakuClient.parseChat(data) {
+                    self.reconnectDelay = 2.5
+                    if case .data(let data) = message,
+                       let chat = DanmakuClient.parseChat(data) {
                         self.onMessage?(chat.user, chat.text, chat.color)
                     }
-                    self.receive(generation: gen)
+                    self.receive(id)
                 case .failure(let error):
-                    self.handleDisconnect(generation: gen, error: error)
+                    self.fail(id: id, reason: error.localizedDescription)
                 }
             }
         }
     }
 
-    private func startHeartbeat(generation gen: Int) {
+    private func startHeartbeat(_ id: Int) {
         heartbeatTimer?.invalidate()
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, gen == self.generation, self.wanted else { return }
-                self.task?.send(.data(danmakuHeartbeat)) { [weak self] error in
+                guard let self, self.wanted, id == self.token, let task = self.task else { return }
+                task.send(.data(danmakuHeartbeat)) { [weak self] error in
                     guard let error else { return }
                     Task { @MainActor in
-                        self?.handleDisconnect(generation: gen, error: error)
+                        guard let self, self.wanted, id == self.token else { return }
+                        self.fail(id: id, reason: error.localizedDescription)
                     }
                 }
             }
         }
     }
 
-    private func handleDisconnect(generation gen: Int, error: Error?) {
-        guard gen == generation, wanted else { return }
-        teardownSocket()
+    /// Tears the current socket down and schedules exactly one reconnect attempt.
+    private func fail(id: Int, reason: String) {
+        guard wanted, id == token else { return }
+        onDiagnostic?(reason)
+        // Bump the token before teardown so the receive cancellation callback cannot
+        // schedule a second, competing reconnect.
+        token += 1
+        teardown()
         onStatus?("弹幕未连接", false)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            Task { @MainActor in
-                guard let self, gen == self.generation, self.wanted else { return }
-                self.onStatus?("弹幕连接中", false)
-                self.connect(generation: gen)
-            }
-        }
+        scheduleReconnect(after: reconnectDelay)
+        reconnectDelay = min(reconnectDelay * 1.5, 30)
     }
 
-    private func teardownSocket() {
+    private func scheduleReconnect(after delay: TimeInterval) {
+        guard wanted, reconnectItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, self.wanted else { return }
+                self.reconnectItem = nil
+                self.openNewConnection()
+            }
+        }
+        reconnectItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func teardown() {
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
-        session?.invalidateAndCancel()
-        session = nil
     }
 
     // MARK: - Wire format
