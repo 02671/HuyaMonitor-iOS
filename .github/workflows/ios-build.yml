@@ -25,7 +25,7 @@ jobs:
             -target HuyaMonitor \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath build \
+            SYMROOT="$PWD/build" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -35,7 +35,7 @@ jobs:
         working-directory: ios
         run: |
           mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/HuyaMonitor.app Payload/
+          cp -R build/Release-iphoneos/HuyaMonitor.app Payload/
           zip -qry HuyaMonitor-unsigned.ipa Payload
           ls -lh HuyaMonitor-unsigned.ipa
 
