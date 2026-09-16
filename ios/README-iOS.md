@@ -8,7 +8,7 @@
 | --- | --- |
 | 房号查询房间信息 | `HuyaAPI.fetchRoom`，接口与原版一致（`mp.huya.com/cache.php`） |
 | 按主播名搜索 | `HuyaAPI.searchAnchors`（`search.cdn.huya.com`），开播的排前面并显示绿色 |
-| 弹幕（TARS 协议 WebSocket） | `Tars.swift` + `DanmakuClient.swift`，连接 `wss://cdnws.api.huya.com`，30 秒心跳，断线自动重连（单次重连 + 退避，最多 30 秒） |
+| 弹幕（TARS 协议 WebSocket） | `Tars.swift` + `DanmakuClient.swift`，基于 Network.framework 自建 WebSocket 连接 `cdnws.api.huya.com:443`，30 秒心跳，断线自动重连（单飞 + 退避，上限 30 秒） |
 | 贵族弹幕颜色 | `DanmakuClient.parseChat` 读取颜色字段，`Color(hex:)` 渲染 |
 | 音频播放（原版 ffplay） | `AudioPlayer.swift` 使用 AVPlayer 播放 HLS 流 |
 | 省流量 | 自动读取虎牙画质列表 `rateArray`，固定使用最低画质「流畅」（如 500 kbps），并给 AVPlayer 设置 `preferredPeakBitRate` 上限，避免自动升到高码率 |
@@ -36,7 +36,9 @@
 - 画质由 `ratio` 参数决定，其取值就是画质列表里的 `iBitRate`。`ratio` 不参与 `wsSecret` 签名计算，所以修改它不会让链接失效。
 - 所有网络请求的 UA / Referer 与原版保持一致。
 - 弹幕 TARS 编解码为逐行移植，字段号、心跳包、URI 1400 均未改动。
-- 弹幕重连采用「单飞」模型：每次连接分配一个 token，所有异步回调都会校验 token，拆除连接时先递增 token 再取消任务。这样 `URLSession` 在取消时抛出的回调不会启动第二个重连链，避免重连风暴。断线后按 1.5 倍退避重连，收到任意数据即重置为 2.5 秒。
+- 弹幕没有使用 `URLSessionWebSocketTask`，而是基于 `Network.framework` 自建了极简 WebSocket 客户端。原因是 `URLSessionWebSocketTask` 在升级请求里会带上 `Sec-WebSocket-Extensions: permessage-deflate`，虎牙 CDN 接受后会下发 RSV1 压缩帧，而 iOS 的 WebSocket 层处理这些帧时报 EPROTO（界面上表现为「Protocol error」）。自建客户端不发送该扩展头，服务器就不会启用压缩，帧始终是明文。这一点已用底层 socket 实测确认：不协商压缩时连续 70 余秒内所有帧 `rsv1=0`；协商压缩后服务器立刻开始发送 RSV1 帧。
+- 弹幕重连采用「单飞」模型：每次连接分配一个 token，所有异步回调都会校验 token，拆除连接时先递增 token 再取消任务，避免重连风暴。断线后按 1.5 倍退避重连，成功握手即重置为 2.5 秒。
+- 逐字节解析协议：客户端发出的帧带掩码（mask），服务端下发的帧不带掩码；同时处理 126/127 扩展长度、分片消息（continuation）、ping/pong 和 close 帧。
 
 ## 构建与安装
 
