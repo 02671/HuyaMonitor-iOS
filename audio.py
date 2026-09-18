@@ -25,8 +25,8 @@ def find_ffplay():
     return shutil.which("ffplay") or shutil.which("ffplay.exe")
 
 
-REFRESH_SEC = 150
-OVERLAP_SEC = 1.4
+REFRESH_SEC = 120
+OVERLAP_SEC = 2.0
 
 
 def _win_set_pid_volume(pid, level):

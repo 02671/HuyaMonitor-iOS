@@ -4,21 +4,23 @@ import MediaPlayer
 @MainActor
 final class AudioPlayer {
 
+    static let refreshSec: TimeInterval = 120
+    static let overlapSec: TimeInterval = 2.0
+
     var onStatus: ((_ text: String, _ ok: Bool) -> Void)?
     var onDiagnostic: ((String) -> Void)?
 
     private var player: AVPlayer?
+    private var overlapPlayer: AVPlayer?
     private var itemObservation: NSKeyValueObservation?
     private var controlObservation: NSKeyValueObservation?
+    private var overlapItemObservation: NSKeyValueObservation?
     private var failureObserver: NSObjectProtocol?
     private var endedObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
     private var errorLogObserver: NSObjectProtocol?
     private var interruptionObserver: NSObjectProtocol?
     private var remoteCommandsConfigured = false
-
-    private let loader = StreamLoader()
-    private let loaderQueue = DispatchQueue(label: "huya.audio.resource")
 
     private var roomId = ""
     private var lineIndex = 0
@@ -27,8 +29,11 @@ final class AudioPlayer {
     private var volume: Float = 1.0
     private var reconnectItem: DispatchWorkItem?
     private var readyWatchdog: DispatchWorkItem?
+    private var refreshItem: DispatchWorkItem?
+    private var overlapItem: DispatchWorkItem?
     private var reconnectDelay: TimeInterval = 2.5
     private var loadTask: Task<Void, Never>?
+    private var lastTitle: String?
 
     var isRunning: Bool { wanted }
     var isPlaying: Bool { player?.timeControlStatus == .playing }
@@ -57,9 +62,15 @@ final class AudioPlayer {
         reconnectItem = nil
         readyWatchdog?.cancel()
         readyWatchdog = nil
+        refreshItem?.cancel()
+        refreshItem = nil
+        overlapItem?.cancel()
+        overlapItem = nil
         teardownItem()
         player?.pause()
         player?.replaceCurrentItem(with: nil)
+        player = nil
+        dropOverlap()
         if notify {
             onStatus?("音频未连接", false)
         }
@@ -68,6 +79,7 @@ final class AudioPlayer {
     func setVolume(_ value: Double) {
         volume = Float(max(0, min(1, value)))
         player?.volume = volume
+        overlapPlayer?.volume = volume
     }
 
     func ensurePlaying() {
@@ -100,39 +112,74 @@ final class AudioPlayer {
         reconnectItem = nil
         readyWatchdog?.cancel()
         readyWatchdog = nil
+        refreshItem?.cancel()
+        refreshItem = nil
         loadTask?.cancel()
         onStatus?("音频连接中", false)
-        loadTask = Task { await self.loadAndPlay(id: id) }
+        loadTask = Task { await self.loadAndPlay(id: id, overlap: false) }
     }
 
-    private func loadAndPlay(id: Int) async {
+    private func refresh() {
+        guard wanted else { return }
+        let id = token
+        loadTask?.cancel()
+        loadTask = Task { await self.loadAndPlay(id: id, overlap: true) }
+    }
+
+    private func loadAndPlay(id: Int, overlap: Bool) async {
         guard wanted, id == token else { return }
         do {
+            try await StreamProxy.shared.start()
             let room = try await HuyaAPI.fetchRoom(roomId)
             let result = try await HuyaAPI.buildPlayURL(room, lineIndex: lineIndex)
             lineIndex = result.lineIndex
             guard wanted, id == token else { return }
-            replaceItem(urlString: result.url, room: room, id: id)
+            attach(urlString: result.url, room: room, id: id, overlap: overlap)
         } catch {
             guard wanted, id == token else { return }
-            fail(id: id, reason: error.localizedDescription)
+            if overlap {
+                onDiagnostic?(error.localizedDescription)
+                armRefresh(id: id)
+            } else {
+                fail(id: id, reason: error.localizedDescription)
+            }
         }
     }
 
-    private func replaceItem(urlString: String, room: HuyaRoom, id: Int) {
+    private func attach(urlString: String, room: HuyaRoom, id: Int, overlap: Bool) {
         guard wanted, id == token else { return }
         guard let httpsURL = URL(string: urlString) else {
             fail(id: id, reason: "音频地址无效")
             return
         }
-        let playURL = StreamLoader.playbackURL(from: httpsURL)
-        let asset = AVURLAsset(url: playURL)
-        asset.resourceLoader.setDelegate(loader, queue: loaderQueue)
+        let playURL: URL
+        do {
+            playURL = try StreamProxy.shared.playbackURL(from: httpsURL)
+        } catch {
+            fail(id: id, reason: error.localizedDescription)
+            return
+        }
 
+        let headers: [String: String] = HuyaAPI.playbackHeaders
+        let asset = AVURLAsset(url: playURL, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
         let item = AVPlayerItem(asset: asset)
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         item.preferredForwardBufferDuration = 8
 
+        let title = room.nick.isEmpty ? room.title : room.nick
+        lastTitle = title.isEmpty ? nil : title
+
+        if overlap, player?.currentItem != nil {
+            beginOverlap(item: item, id: id)
+        } else {
+            replace(item: item, id: id)
+            armReadyWatchdog(id: id)
+        }
+        updateNowPlaying(title: lastTitle)
+    }
+
+    private func replace(item: AVPlayerItem, id: Int) {
+        dropOverlap()
         teardownItem()
         if player == nil {
             let newPlayer = AVPlayer(playerItem: item)
@@ -144,9 +191,86 @@ final class AudioPlayer {
         player?.volume = volume
         observe(item: item, id: id)
         player?.play()
-        let title = room.nick.isEmpty ? room.title : room.nick
-        updateNowPlaying(title: title.isEmpty ? nil : title)
-        armReadyWatchdog(id: id)
+    }
+
+    private func beginOverlap(item: AVPlayerItem, id: Int) {
+        overlapItem?.cancel()
+        overlapItemObservation?.invalidate()
+        overlapPlayer?.pause()
+        overlapPlayer?.replaceCurrentItem(with: nil)
+
+        let incoming = AVPlayer(playerItem: item)
+        incoming.automaticallyWaitsToMinimizeStalling = true
+        incoming.volume = volume
+        overlapPlayer = incoming
+        overlapItemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            Task { @MainActor in
+                guard let self, self.wanted, id == self.token else { return }
+                if item.status == .readyToPlay {
+                    incoming.play()
+                    self.finishOverlap(id: id)
+                } else if item.status == .failed {
+                    self.overlapItemObservation?.invalidate()
+                    self.overlapItemObservation = nil
+                    incoming.pause()
+                    self.overlapPlayer = nil
+                    let reason = item.error?.localizedDescription ?? "换链失败"
+                    self.onDiagnostic?(reason)
+                    self.armRefresh(id: id)
+                }
+            }
+        }
+        incoming.play()
+        overlapItem?.cancel()
+        let timeout = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, self.wanted, id == self.token else { return }
+                guard self.overlapPlayer === incoming else { return }
+                self.dropOverlap()
+                self.onDiagnostic?("换链超时，继续当前音频")
+                self.armRefresh(id: id)
+            }
+        }
+        overlapItem = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: timeout)
+    }
+
+    private func finishOverlap(id: Int) {
+        overlapItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, self.wanted, id == self.token else { return }
+                guard let incoming = self.overlapPlayer else { return }
+                self.teardownItem()
+                self.player?.pause()
+                self.player?.replaceCurrentItem(with: nil)
+                self.player = incoming
+                self.overlapPlayer = nil
+                self.overlapItemObservation?.invalidate()
+                self.overlapItemObservation = nil
+                if let item = incoming.currentItem {
+                    self.observe(item: item, id: id)
+                }
+                incoming.play()
+                self.reconnectDelay = 2.5
+                self.onDiagnostic?("")
+                self.onStatus?("音频已连接", true)
+                self.armRefresh(id: id)
+                self.updateNowPlaying()
+            }
+        }
+        overlapItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.overlapSec, execute: work)
+    }
+
+    private func dropOverlap() {
+        overlapItem?.cancel()
+        overlapItem = nil
+        overlapItemObservation?.invalidate()
+        overlapItemObservation = nil
+        overlapPlayer?.pause()
+        overlapPlayer?.replaceCurrentItem(with: nil)
+        overlapPlayer = nil
     }
 
     private func armReadyWatchdog(id: Int) {
@@ -164,6 +288,18 @@ final class AudioPlayer {
         DispatchQueue.main.asyncAfter(deadline: .now() + 25, execute: item)
     }
 
+    private func armRefresh(id: Int) {
+        refreshItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, self.wanted, id == self.token else { return }
+                self.refresh()
+            }
+        }
+        refreshItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.refreshSec, execute: item)
+    }
+
     private func fail(id: Int, reason: String) {
         guard wanted, id == token else { return }
         onDiagnostic?(reason)
@@ -172,6 +308,9 @@ final class AudioPlayer {
         loadTask = nil
         readyWatchdog?.cancel()
         readyWatchdog = nil
+        refreshItem?.cancel()
+        refreshItem = nil
+        dropOverlap()
         teardownItem()
         player?.pause()
         player?.replaceCurrentItem(with: nil)
@@ -195,7 +334,7 @@ final class AudioPlayer {
     }
 
     private func observe(item: AVPlayerItem, id: Int) {
-        itemObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        itemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in
                 guard let self, self.wanted, id == self.token else { return }
                 switch item.status {
@@ -206,9 +345,10 @@ final class AudioPlayer {
                     self.onDiagnostic?("")
                     self.onStatus?("音频已连接", true)
                     self.player?.play()
+                    self.armRefresh(id: id)
                     self.updateNowPlaying()
                 case .failed:
-                    let reason = item.error?.localizedDescription ?? "播放失败"
+                    let reason = Self.describe(item.error) ?? "播放失败"
                     self.fail(id: id, reason: reason)
                 default:
                     break
@@ -231,7 +371,7 @@ final class AudioPlayer {
             Task { @MainActor in
                 guard let self, self.wanted, id == self.token else { return }
                 let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
-                self.fail(id: id, reason: error?.localizedDescription ?? "播放中断")
+                self.fail(id: id, reason: Self.describe(error) ?? "播放中断")
             }
         }
         endedObserver = center.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
@@ -257,6 +397,15 @@ final class AudioPlayer {
                 }
             }
         }
+    }
+
+    private static func describe(_ error: Error?) -> String? {
+        guard let error else { return nil }
+        let ns = error as NSError
+        if ns.domain == "CoreMediaErrorDomain" && ns.code == -12881 {
+            return "播放器拒绝自定义地址的分片（已改为本地代理）"
+        }
+        return error.localizedDescription
     }
 
     private func teardownItem() {

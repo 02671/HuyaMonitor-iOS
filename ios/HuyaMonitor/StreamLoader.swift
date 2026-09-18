@@ -1,135 +1,281 @@
-import AVFoundation
-import UniformTypeIdentifiers
+import Foundation
+import Network
 
-/// Fetches every HLS playlist and media segment with the same browser headers the
-/// Windows ffplay client sends. AVPlayer will not call a resource-loader delegate
-/// for `https://` URLs, so playback uses the custom `hyhls://` scheme and this
-/// object translates it back to HTTPS.
+/// Local loopback reverse proxy so AVPlayer talks HTTP while every Huya playlist
+/// and media segment is fetched with browser `User-Agent` / `Referer` / `Origin`.
 ///
-/// Without this, only the first playlist request (via the undocumented
-/// `AVURLAssetHTTPHeaderFieldsKey`) would carry `Referer` / `User-Agent`. Segment
-/// requests go out as `AppleCoreMedia/...`, Huya's CDN answers 403, the item
-/// fails, and the player reconnects in a loop.
-final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
+/// A custom URL scheme plus `AVAssetResourceLoaderDelegate` cannot feed HLS
+/// segments: CoreMedia rejects them with error -12881 ("custom url not redirect").
+/// Only playlists may use a custom scheme; `.ts` / fMP4 must be HTTP(S). This
+/// proxy keeps the player on `http://127.0.0.1` and attaches the required headers
+/// on the upstream request.
+final class StreamProxy {
 
-    static let scheme = "hyhls"
+    static let shared = StreamProxy()
 
+    private let queue = DispatchQueue(label: "huya.stream.proxy")
     private let session: URLSession
-    private let queue = DispatchQueue(label: "huya.stream.loader")
-    private var tasks: [ObjectIdentifier: URLSessionDataTask] = [:]
+    private var listener: NWListener?
+    private var port: UInt16 = 0
+    private var startWaiters: [CheckedContinuation<Void, Error>] = []
 
-    override init() {
+    private init() {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20
         config.httpAdditionalHeaders = HuyaAPI.playbackHeaders
         session = URLSession(configuration: config)
-        super.init()
     }
 
-    static func playbackURL(from httpsURL: URL) -> URL {
-        var parts = URLComponents(url: httpsURL, resolvingAgainstBaseURL: false)
-        parts?.scheme = scheme
-        return parts?.url ?? httpsURL
-    }
-
-    func resourceLoader(
-        _ resourceLoader: AVAssetResourceLoader,
-        shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
-    ) -> Bool {
-        queue.async { self.start(loadingRequest) }
-        return true
-    }
-
-    func resourceLoader(
-        _ resourceLoader: AVAssetResourceLoader,
-        didCancel loadingRequest: AVAssetResourceLoadingRequest
-    ) {
-        queue.async {
-            let key = ObjectIdentifier(loadingRequest)
-            self.tasks[key]?.cancel()
-            self.tasks[key] = nil
+    func start() async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            queue.async {
+                if self.port != 0 {
+                    cont.resume()
+                    return
+                }
+                self.startWaiters.append(cont)
+                if self.listener == nil {
+                    self.bind()
+                }
+            }
         }
     }
 
-    private func start(_ request: AVAssetResourceLoadingRequest) {
-        guard let original = request.request.url, let real = httpsURL(from: original) else {
-            request.finishLoading(with: HuyaError.message("音频地址无效"))
+    func stop() {
+        queue.async {
+            self.listener?.cancel()
+            self.listener = nil
+            self.port = 0
+            let waiters = self.startWaiters
+            self.startWaiters.removeAll()
+            waiters.forEach { $0.resume(throwing: HuyaError.message("音频代理已停止")) }
+        }
+    }
+
+    func playbackURL(from httpsURL: URL) throws -> URL {
+        let bound = queue.sync { port }
+        return try makePlaybackURL(from: httpsURL, port: bound)
+    }
+
+    private func makePlaybackURL(from httpsURL: URL, port: UInt16) throws -> URL {
+        var parts = URLComponents()
+        parts.scheme = "http"
+        parts.host = "127.0.0.1"
+        parts.port = Int(port)
+        parts.path = "/"
+        parts.queryItems = [URLQueryItem(name: "u", value: httpsURL.absoluteString)]
+        guard let url = parts.url, port > 0 else {
+            throw HuyaError.message("音频代理未启动")
+        }
+        return url
+    }
+
+    // MARK: - Listen
+
+    private func bind() {
+        do {
+            let listener = try NWListener(using: .tcp, on: .any)
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.serve(connection)
+            }
+            listener.stateUpdateHandler = { [weak self] state in
+                self?.queue.async { self?.handleListener(state) }
+            }
+            self.listener = listener
+            listener.start(queue: queue)
+        } catch {
+            failStart(error)
+        }
+    }
+
+    private func handleListener(_ state: NWListener.State) {
+        switch state {
+        case .ready:
+            if let value = listener?.port?.rawValue, value > 0 {
+                port = value
+                let waiters = startWaiters
+                startWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+            }
+        case .failed(let error):
+            failStart(error)
+        case .cancelled:
+            port = 0
+        default:
+            break
+        }
+    }
+
+    private func failStart(_ error: Error) {
+        listener?.cancel()
+        listener = nil
+        port = 0
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume(throwing: error) }
+    }
+
+    // MARK: - HTTP
+
+    private func serve(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        receiveHeaders(connection, buffer: Data())
+    }
+
+    private func receiveHeaders(_ connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 32 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            if error != nil {
+                connection.cancel()
+                return
+            }
+            var next = buffer
+            if let data { next.append(data) }
+            if let range = next.range(of: Data("\r\n\r\n".utf8)) {
+                let header = next.subdata(in: 0..<range.upperBound)
+                self.handleRequest(connection, headerData: header)
+                return
+            }
+            if next.count > 64 * 1024 || isComplete {
+                connection.cancel()
+                return
+            }
+            self.receiveHeaders(connection, buffer: next)
+        }
+    }
+
+    private func handleRequest(_ connection: NWConnection, headerData: Data) {
+        guard let headerText = String(data: headerData, encoding: .isoLatin1) else {
+            reply(connection, status: 400, reason: "Bad Request", body: Data(), contentType: "text/plain")
+            return
+        }
+        let lines = headerText.split(separator: "\r\n", omittingEmptySubsequences: false)
+        guard let requestLine = lines.first else {
+            reply(connection, status: 400, reason: "Bad Request", body: Data(), contentType: "text/plain")
+            return
+        }
+        let parts = requestLine.split(separator: " ")
+        guard parts.count >= 2 else {
+            reply(connection, status: 400, reason: "Bad Request", body: Data(), contentType: "text/plain")
+            return
+        }
+        let path = String(parts[1])
+        let headers = parseHeaders(lines.dropFirst())
+        guard let upstream = upstreamURL(from: path) else {
+            reply(connection, status: 404, reason: "Not Found", body: Data(), contentType: "text/plain")
             return
         }
 
-        var urlRequest = URLRequest(url: real)
-        urlRequest.timeoutInterval = 20
+        var request = URLRequest(url: upstream)
+        request.timeoutInterval = 20
         for (header, value) in HuyaAPI.playbackHeaders {
-            urlRequest.setValue(value, forHTTPHeaderField: header)
+            request.setValue(value, forHTTPHeaderField: header)
+        }
+        if let range = headers["range"] {
+            request.setValue(range, forHTTPHeaderField: "Range")
         }
 
-        let task = session.dataTask(with: urlRequest) { [weak self] data, response, error in
+        session.dataTask(with: request) { [weak self] data, response, error in
             self?.queue.async {
-                self?.tasks[ObjectIdentifier(request)] = nil
-                self?.complete(request, realURL: real, data: data, response: response, error: error)
+                self?.complete(connection, upstream: upstream, data: data, response: response, error: error)
             }
-        }
-        tasks[ObjectIdentifier(request)] = task
-        task.resume()
+        }.resume()
     }
 
     private func complete(
-        _ request: AVAssetResourceLoadingRequest,
-        realURL: URL,
+        _ connection: NWConnection,
+        upstream: URL,
         data: Data?,
         response: URLResponse?,
         error: Error?
     ) {
-        if request.isCancelled { return }
         if let error {
-            request.finishLoading(with: error)
+            let body = Data(error.localizedDescription.utf8)
+            reply(connection, status: 502, reason: "Bad Gateway", body: body, contentType: "text/plain")
             return
         }
         guard var data else {
-            request.finishLoading(with: HuyaError.message("音频数据为空"))
+            reply(connection, status: 502, reason: "Bad Gateway", body: Data("empty".utf8), contentType: "text/plain")
             return
         }
-
         let http = response as? HTTPURLResponse
         let status = http?.statusCode ?? 200
         if status >= 400 {
-            request.finishLoading(with: HuyaError.message("音频服务器返回 \(status)"))
+            reply(connection, status: status, reason: "Upstream", body: data, contentType: "text/plain")
             return
         }
 
         let mime = http?.value(forHTTPHeaderField: "Content-Type") ?? response?.mimeType ?? ""
+        var contentType = mime.isEmpty ? "application/octet-stream" : mime
         if isPlaylist(data: data, mime: mime) {
             guard let text = String(data: data, encoding: .utf8)
                 ?? String(data: data, encoding: .isoLatin1) else {
-                request.finishLoading(with: HuyaError.message("播放列表无法解码"))
+                reply(connection, status: 502, reason: "Bad Gateway", body: Data("playlist".utf8), contentType: "text/plain")
                 return
             }
-            data = Data(rewritePlaylist(text, playlistURL: realURL).utf8)
+            data = Data(rewritePlaylist(text, playlistURL: upstream).utf8)
+            contentType = "application/vnd.apple.mpegurl"
+        } else if mime.isEmpty {
+            contentType = inferredType(for: upstream)
         }
-
-        if let info = request.contentInformationRequest {
-            info.contentType = uti(for: mime, data: data)
-            info.isByteRangeAccessSupported = !isPlaylist(data: data, mime: mime)
-            info.contentLength = Int64(data.count)
+        var extra: [String: String] = [:]
+        if let range = http?.value(forHTTPHeaderField: "Content-Range") {
+            extra["Content-Range"] = range
         }
-        if let dataRequest = request.dataRequest {
-            let start = Int(dataRequest.currentOffset)
-            if start < data.count {
-                let remaining = data.count - start
-                let wanted: Int
-                if dataRequest.requestsAllDataToEndOfResource || dataRequest.requestedLength == Int.max {
-                    wanted = remaining
-                } else {
-                    let end = Int(dataRequest.requestedOffset) + dataRequest.requestedLength
-                    wanted = min(remaining, max(0, end - start))
-                }
-                if wanted > 0 {
-                    dataRequest.respond(with: data.subdata(in: start..<(start + wanted)))
-                }
-            }
+        if let accept = http?.value(forHTTPHeaderField: "Accept-Ranges") {
+            extra["Accept-Ranges"] = accept
         }
-        request.finishLoading()
+        reply(connection, status: status, reason: status == 206 ? "Partial Content" : "OK", body: data, contentType: contentType, extra: extra)
     }
+
+    private func reply(
+        _ connection: NWConnection,
+        status: Int,
+        reason: String,
+        body: Data,
+        contentType: String,
+        extra: [String: String] = [:]
+    ) {
+        var header = "HTTP/1.1 \(status) \(reason)\r\n"
+        header += "Content-Type: \(contentType)\r\n"
+        header += "Content-Length: \(body.count)\r\n"
+        header += "Connection: close\r\n"
+        header += "Cache-Control: no-store\r\n"
+        for (name, value) in extra {
+            header += "\(name): \(value)\r\n"
+        }
+        header += "Access-Control-Allow-Origin: *\r\n"
+        header += "\r\n"
+        var payload = Data(header.utf8)
+        payload.append(body)
+        connection.send(content: payload, isComplete: true, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+
+    private func parseHeaders(_ lines: ArraySlice<Substring>) -> [String: String] {
+        var headers: [String: String] = [:]
+        for line in lines {
+            guard let idx = line.firstIndex(of: ":") else { continue }
+            let name = line[..<idx].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let value = line[line.index(after: idx)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty { headers[name] = value }
+        }
+        return headers
+    }
+
+    private func upstreamURL(from pathAndQuery: String) -> URL? {
+        let full = pathAndQuery.hasPrefix("http") ? pathAndQuery : "http://127.0.0.1\(pathAndQuery)"
+        guard let components = URLComponents(string: full) else { return nil }
+        let value = components.queryItems?.first(where: { $0.name == "u" })?.value
+        guard let value, let url = URL(string: value) else { return nil }
+        return httpsify(url)
+    }
+
+    // MARK: - Playlist rewrite
 
     private func isPlaylist(data: Data, mime: String) -> Bool {
         let lower = mime.lowercased()
@@ -138,18 +284,13 @@ final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
         return false
     }
 
-    private func uti(for mime: String, data: Data) -> String {
-        let lower = mime.lowercased()
-        if lower.contains("mpegurl") || lower.contains("m3u") || data.starts(with: Data("#EXTM3U".utf8)) {
-            return UTType.m3uPlaylist.identifier
-        }
-        if lower.contains("mp2t") || lower.contains("mpegts") {
-            return "public.mpeg-2-transport-stream"
-        }
-        if lower.contains("mp4") || lower.contains("aac") {
-            return UTType.mpeg4Movie.identifier
-        }
-        return UTType.data.identifier
+    private func inferredType(for url: URL) -> String {
+        let name = url.path.lowercased()
+        if name.hasSuffix(".m3u8") || name.hasSuffix(".m3u") { return "application/vnd.apple.mpegurl" }
+        if name.hasSuffix(".ts") { return "video/MP2T" }
+        if name.hasSuffix(".mp4") || name.hasSuffix(".m4s") { return "video/mp4" }
+        if name.hasSuffix(".aac") { return "audio/aac" }
+        return "application/octet-stream"
     }
 
     private func rewritePlaylist(_ text: String, playlistURL: URL) -> String {
@@ -181,8 +322,7 @@ final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
                 remaining = remaining[end...]
             }
         }
-        result += remaining
-        return result
+        return result + remaining
     }
 
     private func rewriteURLString(_ value: String, playlistURL: URL) -> String {
@@ -193,13 +333,7 @@ final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
             resolved = URL(string: value, relativeTo: playlistURL)?.absoluteURL
         }
         guard let resolved else { return value }
-        return Self.playbackURL(from: httpsify(resolved)).absoluteString
-    }
-
-    private func httpsURL(from custom: URL) -> URL? {
-        var parts = URLComponents(url: custom, resolvingAgainstBaseURL: false)
-        parts?.scheme = "https"
-        return parts?.url
+        return (try? makePlaybackURL(from: httpsify(resolved), port: port))?.absoluteString ?? value
     }
 
     private func httpsify(_ url: URL) -> URL {
