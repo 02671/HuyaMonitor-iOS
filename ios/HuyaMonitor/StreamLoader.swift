@@ -16,7 +16,7 @@ final class StreamProxy {
     var onUpstreamForbidden: (() -> Void)?
 
     private let queue = DispatchQueue(label: "huya.stream.proxy")
-    private let session: URLSession
+    private var session: URLSession
     private var listener: NWListener?
     private var port: UInt16 = 0
     private var startWaiters: [CheckedContinuation<Void, Error>] = []
@@ -24,10 +24,7 @@ final class StreamProxy {
     private var generation = 0
 
     private init() {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 20
-        config.httpAdditionalHeaders = HuyaAPI.playbackHeaders
-        session = URLSession(configuration: config)
+        session = Self.makeSession()
     }
 
     func start() async throws {
@@ -46,15 +43,20 @@ final class StreamProxy {
     }
 
     func stop() {
-        queue.async {
+        var toCancel: NWListener?
+        queue.sync {
             self.generation += 1
-            self.listener?.cancel()
+            self.lastForbiddenAt = 0
+            self.session.invalidateAndCancel()
+            self.session = Self.makeSession()
+            toCancel = self.listener
             self.listener = nil
             self.port = 0
             let waiters = self.startWaiters
             self.startWaiters.removeAll()
             waiters.forEach { $0.resume(throwing: HuyaError.message("音频代理已停止")) }
         }
+        toCancel?.cancel()
     }
 
     func bumpGeneration() {
@@ -64,19 +66,38 @@ final class StreamProxy {
         }
     }
 
-    func playbackURL(from httpsURL: URL) throws -> URL {
-        let bound = queue.sync { port }
-        return try makePlaybackURL(from: httpsURL, port: bound)
+    func resetForNewSession() {
+        queue.sync {
+            self.generation += 1
+            self.lastForbiddenAt = 0
+            self.session.invalidateAndCancel()
+            self.session = Self.makeSession()
+        }
     }
 
-    private func makePlaybackURL(from httpsURL: URL, port: UInt16) throws -> URL {
+    private static func makeSession() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 20
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        config.httpAdditionalHeaders = HuyaAPI.playbackHeaders
+        return URLSession(configuration: config)
+    }
+
+    func playbackURL(from httpsURL: URL) throws -> URL {
+        let snapshot: (UInt16, Int) = queue.sync { (port, generation) }
+        return try makePlaybackURL(from: httpsURL, port: snapshot.0, generation: snapshot.1)
+    }
+
+    private func makePlaybackURL(from httpsURL: URL, port: UInt16, generation: Int? = nil) throws -> URL {
         guard port > 0 else {
             throw HuyaError.message("音频代理未启动")
         }
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
         let encoded = httpsURL.absoluteString.addingPercentEncoding(withAllowedCharacters: allowed) ?? httpsURL.absoluteString
-        guard let url = URL(string: "http://127.0.0.1:\(port)/p?u=\(encoded)") else {
+        let gen = generation ?? self.generation
+        guard let url = URL(string: "http://127.0.0.1:\(port)/p/\(gen)/s?u=\(encoded)") else {
             throw HuyaError.message("音频代理地址无效")
         }
         return url
@@ -90,8 +111,11 @@ final class StreamProxy {
             listener.newConnectionHandler = { [weak self] connection in
                 self?.serve(connection)
             }
-            listener.stateUpdateHandler = { [weak self] state in
-                self?.queue.async { self?.handleListener(state) }
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                self?.queue.async {
+                    guard let self, self.listener === listener else { return }
+                    self.handleListener(state)
+                }
             }
             self.listener = listener
             listener.start(queue: queue)
@@ -176,13 +200,16 @@ final class StreamProxy {
         }
         let path = String(parts[1])
         let headers = parseHeaders(lines.dropFirst())
+        if let requested = pathGeneration(from: path), requested != generation {
+            reply(connection, status: 410, reason: "Gone", body: Data(), contentType: "text/plain")
+            return
+        }
         guard let upstream = upstreamURL(from: path) else {
             reply(connection, status: 404, reason: "Not Found", body: Data(), contentType: "text/plain")
             return
         }
 
-        var request = URLRequest(url: upstream)
-        request.timeoutInterval = 20
+        var request = URLRequest(url: upstream, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         for (header, value) in HuyaAPI.playbackHeaders {
             request.setValue(value, forHTTPHeaderField: header)
         }
@@ -304,6 +331,13 @@ final class StreamProxy {
             if !name.isEmpty { headers[name] = value }
         }
         return headers
+    }
+
+    private func pathGeneration(from pathAndQuery: String) -> Int? {
+        let pathOnly = pathAndQuery.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? pathAndQuery
+        let pieces = pathOnly.split(separator: "/").map(String.init)
+        guard pieces.count >= 2, pieces[0] == "p", let value = Int(pieces[1]) else { return nil }
+        return value
     }
 
     private func upstreamURL(from pathAndQuery: String) -> URL? {

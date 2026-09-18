@@ -63,7 +63,7 @@ final class AudioPlayer {
         configureSession()
         configureRemoteCommands()
         observeInterruptions()
-        StreamProxy.shared.bumpGeneration()
+        StreamProxy.shared.resetForNewSession()
         StreamProxy.shared.onUpstreamForbidden = { [weak self] in
             Task { @MainActor in
                 guard let self, self.wanted, self.sessionId == sid else { return }
@@ -94,7 +94,7 @@ final class AudioPlayer {
         player = nil
         dropOverlap()
         StreamProxy.shared.onUpstreamForbidden = nil
-        StreamProxy.shared.bumpGeneration()
+        StreamProxy.shared.stop()
         resigning = false
         lastResignAt = 0
         if notify {
@@ -187,7 +187,6 @@ final class AudioPlayer {
 
     private func loadAndPlay(id: Int, overlap: Bool) async {
         guard wanted, id == token else { return }
-        resigning = false
         do {
             try await StreamProxy.shared.start()
             let room = try await HuyaAPI.fetchRoom(roomId)
@@ -198,6 +197,9 @@ final class AudioPlayer {
             lineIndex = result.lineIndex
             guard wanted, id == token else { return }
             attach(urlString: result.url, room: room, id: id, overlap: overlap)
+            if wanted, id == token {
+                resigning = false
+            }
         } catch {
             guard wanted, id == token else { return }
             if overlap {
@@ -246,13 +248,12 @@ final class AudioPlayer {
     private func replace(item: AVPlayerItem, id: Int) {
         dropOverlap()
         teardownItem()
-        if player == nil {
-            let newPlayer = AVPlayer(playerItem: item)
-            newPlayer.automaticallyWaitsToMinimizeStalling = true
-            player = newPlayer
-        } else {
-            player?.replaceCurrentItem(with: item)
-        }
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+        let newPlayer = AVPlayer(playerItem: item)
+        newPlayer.automaticallyWaitsToMinimizeStalling = true
+        player = newPlayer
         player?.volume = volume
         observe(item: item, id: id)
         player?.play()
@@ -506,8 +507,6 @@ final class AudioPlayer {
         let lower = text.lowercased()
         if lower.contains("403") { return true }
         if lower.contains("forbidden") { return true }
-        if lower.contains("permission") { return true }
-        if lower.contains("cannot open") { return true }
         return false
     }
 

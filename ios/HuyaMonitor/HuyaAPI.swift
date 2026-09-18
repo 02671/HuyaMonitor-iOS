@@ -50,16 +50,23 @@ enum HuyaAPI {
 
     // MARK: - HTTP helpers
 
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 12
+        return URLSession(configuration: config)
+    }()
+
     private static func httpGet(_ urlString: String, headers: [String: String], timeout: TimeInterval = 12) async throws -> Data {
         guard let url = URL(string: urlString) else {
             throw HuyaError.message("地址无效")
         }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = timeout
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, _) = try await session.data(for: request)
         return data
     }
 
@@ -67,15 +74,14 @@ enum HuyaAPI {
         guard let url = URL(string: urlString) else {
             throw HuyaError.message("地址无效")
         }
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         request.httpMethod = "POST"
-        request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, _) = try await session.data(for: request)
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw HuyaError.message("响应解析失败")
         }
@@ -86,7 +92,7 @@ enum HuyaAPI {
 
     static func fetchRoom(_ roomId: String) async throws -> HuyaRoom {
         let id = try normalizeRoomId(roomId)
-        let url = "https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid=\(id)"
+        let url = "https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid=\(id)&_ts=\(Int(Date().timeIntervalSince1970 * 1000))"
         let headers = [
             "User-Agent": mobileUA,
             "Referer": "https://m.huya.com/\(id)",
