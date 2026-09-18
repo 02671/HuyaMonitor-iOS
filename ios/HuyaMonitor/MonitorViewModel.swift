@@ -214,6 +214,7 @@ final class MonitorViewModel: ObservableObject {
     }
 
     func handleForeground() {
+        UIApplication.shared.isIdleTimerDisabled = true
         if danmuWanted {
             danmaku.ensureConnected()
         }
@@ -223,6 +224,7 @@ final class MonitorViewModel: ObservableObject {
     }
 
     func handleBackground() {
+        UIApplication.shared.isIdleTimerDisabled = false
         // Audio intentionally keeps running: AVAudioSession uses the .playback category
         // and UIBackgroundModes contains "audio".
     }

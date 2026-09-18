@@ -21,6 +21,7 @@ final class StreamProxy {
     private var port: UInt16 = 0
     private var startWaiters: [CheckedContinuation<Void, Error>] = []
     private var lastForbiddenAt: TimeInterval = 0
+    private var generation = 0
 
     private init() {
         let config = URLSessionConfiguration.ephemeral
@@ -46,12 +47,20 @@ final class StreamProxy {
 
     func stop() {
         queue.async {
+            self.generation += 1
             self.listener?.cancel()
             self.listener = nil
             self.port = 0
             let waiters = self.startWaiters
             self.startWaiters.removeAll()
             waiters.forEach { $0.resume(throwing: HuyaError.message("音频代理已停止")) }
+        }
+    }
+
+    func bumpGeneration() {
+        queue.sync {
+            self.generation += 1
+            self.lastForbiddenAt = 0
         }
     }
 
@@ -181,9 +190,17 @@ final class StreamProxy {
             request.setValue(range, forHTTPHeaderField: "Range")
         }
 
+        let requestGeneration = generation
         session.dataTask(with: request) { [weak self] data, response, error in
             self?.queue.async {
-                self?.complete(connection, upstream: upstream, data: data, response: response, error: error)
+                self?.complete(
+                    connection,
+                    upstream: upstream,
+                    data: data,
+                    response: response,
+                    error: error,
+                    requestGeneration: requestGeneration
+                )
             }
         }.resume()
     }
@@ -193,7 +210,8 @@ final class StreamProxy {
         upstream: URL,
         data: Data?,
         response: URLResponse?,
-        error: Error?
+        error: Error?,
+        requestGeneration: Int
     ) {
         if let error {
             let body = Data(error.localizedDescription.utf8)
@@ -207,7 +225,7 @@ final class StreamProxy {
         let http = response as? HTTPURLResponse
         let status = http?.statusCode ?? 200
         if status == 403 {
-            notifyForbidden()
+            notifyForbidden(requestGeneration: requestGeneration)
             reply(connection, status: 403, reason: "Forbidden", body: data, contentType: "text/plain")
             return
         }
@@ -239,12 +257,16 @@ final class StreamProxy {
         reply(connection, status: status, reason: status == 206 ? "Partial Content" : "OK", body: data, contentType: contentType, extra: extra)
     }
 
-    private func notifyForbidden() {
+    private func notifyForbidden(requestGeneration: Int) {
+        guard requestGeneration == generation else { return }
         let now = Date().timeIntervalSince1970
         if now - lastForbiddenAt < 1.5 { return }
         lastForbiddenAt = now
         DispatchQueue.main.async { [weak self] in
-            self?.onUpstreamForbidden?()
+            guard let self else { return }
+            let current = self.queue.sync { self.generation }
+            guard current == requestGeneration else { return }
+            self.onUpstreamForbidden?()
         }
     }
 

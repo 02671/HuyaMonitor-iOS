@@ -61,6 +61,9 @@ struct ContentView: View {
             .padding(.bottom, 6)
         }
         .preferredColorScheme(.dark)
+        .onAppear {
+            viewModel.handleForeground()
+        }
         .onChange(of: scenePhase) { phase in
             switch phase {
             case .active:

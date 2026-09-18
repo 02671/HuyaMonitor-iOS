@@ -40,6 +40,7 @@ final class AudioPlayer {
     private var lastRoom: HuyaRoom?
     private var resigning = false
     private var lastResignAt: TimeInterval = 0
+    private var sessionId = 0
 
     var isRunning: Bool { wanted }
     var isPlaying: Bool { player?.timeControlStatus == .playing }
@@ -49,6 +50,8 @@ final class AudioPlayer {
     func start(roomId: String) {
         stop(notify: false)
         wanted = true
+        sessionId += 1
+        let sid = sessionId
         self.roomId = roomId
         self.lineIndex = 0
         reconnectDelay = 2.5
@@ -56,12 +59,15 @@ final class AudioPlayer {
         currentRatio = nil
         lastRoom = nil
         resigning = false
+        lastResignAt = 0
         configureSession()
         configureRemoteCommands()
         observeInterruptions()
+        StreamProxy.shared.bumpGeneration()
         StreamProxy.shared.onUpstreamForbidden = { [weak self] in
             Task { @MainActor in
-                self?.handleForbidden()
+                guard let self, self.wanted, self.sessionId == sid else { return }
+                self.handleForbidden()
             }
         }
         onStatus?("音频连接中", false)
@@ -70,6 +76,7 @@ final class AudioPlayer {
 
     func stop(notify: Bool = true) {
         wanted = false
+        sessionId += 1
         token += 1
         loadTask?.cancel()
         loadTask = nil
@@ -87,7 +94,9 @@ final class AudioPlayer {
         player = nil
         dropOverlap()
         StreamProxy.shared.onUpstreamForbidden = nil
+        StreamProxy.shared.bumpGeneration()
         resigning = false
+        lastResignAt = 0
         if notify {
             onStatus?("音频未连接", false)
         }
@@ -133,6 +142,7 @@ final class AudioPlayer {
         refreshItem = nil
         loadTask?.cancel()
         resigning = false
+        StreamProxy.shared.bumpGeneration()
         onStatus?("音频连接中", false)
         loadTask = Task { await self.loadAndPlay(id: id, overlap: false) }
     }
@@ -146,6 +156,7 @@ final class AudioPlayer {
 
     private func handleForbidden() {
         guard wanted else { return }
+        guard !resigning else { return }
         let now = Date().timeIntervalSince1970
         if now - lastResignAt < 1.2 { return }
         lastResignAt = now
@@ -169,12 +180,14 @@ final class AudioPlayer {
         refreshItem?.cancel()
         readyWatchdog?.cancel()
         loadTask?.cancel()
+        StreamProxy.shared.bumpGeneration()
         onStatus?("音频重连中", false)
         loadTask = Task { await self.loadAndPlay(id: id, overlap: false) }
     }
 
     private func loadAndPlay(id: Int, overlap: Bool) async {
         guard wanted, id == token else { return }
+        resigning = false
         do {
             try await StreamProxy.shared.start()
             let room = try await HuyaAPI.fetchRoom(roomId)
@@ -205,6 +218,7 @@ final class AudioPlayer {
         }
         let playURL: URL
         do {
+            StreamProxy.shared.bumpGeneration()
             playURL = try StreamProxy.shared.playbackURL(from: httpsURL)
         } catch {
             fail(id: id, reason: error.localizedDescription, expired: false)
