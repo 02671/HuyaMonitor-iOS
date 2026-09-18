@@ -12,7 +12,7 @@
 | 贵族弹幕颜色 | `DanmakuClient.parseChat` 读取颜色字段，`Color(hex:)` 渲染 |
 | 音频播放（原版 ffplay） | `AudioPlayer.swift` + `StreamProxy`：AVPlayer 播 HLS，本机 HTTP 反代给每个播放列表和分片补浏览器 UA/Referer，避免 CDN 403 |
 | 省流量 | 自动读取虎牙画质列表 `rateArray`，固定使用最低画质「流畅」（如 500 kbps） |
-| 音频换链 | 每 120 秒重新签名换链，新旧流重叠 2 秒再切，避免直链过期断音 |
+| 音频换链 | 播放中每 90 秒重叠换链；403 / 地址过期时在同一条线立刻重签，连续失败再升一档画质或换线 |
 | 独立开关弹幕 / 音频 | 「弹幕」「音频」两个独立按钮 |
 | 历史房号 + 删除 | `RoomHistoryStore`，存到 App 沙盒 `Documents/history.json` |
 | 清屏 / 音量 / 置顶 / 隐藏 | 清屏、音量保留；置顶与悬浮隐藏属于桌面端窗口概念，iOS 不需要 |

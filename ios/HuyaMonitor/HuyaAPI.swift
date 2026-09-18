@@ -229,7 +229,7 @@ enum HuyaAPI {
 
     // MARK: - Stream URL
 
-    static func buildPlayURL(_ room: HuyaRoom, lineIndex: Int = 0) async throws -> (url: String, lineIndex: Int) {
+    static func buildPlayURL(_ room: HuyaRoom, lineIndex: Int = 0, ratio: Int? = nil) async throws -> (url: String, lineIndex: Int, ratio: Int) {
         guard room.liveOn else {
             throw HuyaError.message("该房间未开播")
         }
@@ -240,18 +240,25 @@ enum HuyaAPI {
         let uid = await anonymousUID()
         var lastError: Error = HuyaError.message("直播流签名失败")
         let count = lines.count
-        let ratio = room.lowestBitRate ?? defaultBitRate
+        let chosen = ratio ?? room.lowestBitRate ?? defaultBitRate
 
         for offset in 0..<count {
             let index = (lineIndex + offset) % count
             do {
-                let url = try buildURL(line: lines[index], uid: uid, ratio: ratio)
-                return (url, index)
+                let url = try buildURL(line: lines[index], uid: uid, ratio: chosen)
+                return (url, index, chosen)
             } catch {
                 lastError = error
             }
         }
         throw lastError
+    }
+
+    static func nextBitRate(in room: HuyaRoom, after current: Int) -> Int? {
+        let higher = room.qualities.map(\.bitRate).filter { $0 > current }.sorted()
+        if let first = higher.first { return first }
+        if current < defaultBitRate { return defaultBitRate }
+        return nil
     }
 
     private static func buildURL(line: HuyaLine, uid: String, ratio: Int) throws -> String {

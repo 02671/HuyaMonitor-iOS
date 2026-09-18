@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 enum ConnectionPhase: Equatable {
     case off
@@ -18,7 +19,7 @@ struct DanmakuLine: Identifiable, Equatable {
     let id = UUID()
     let user: String
     let text: String
-    let color: Color
+    let color: UIColor
     let isSystem: Bool
 }
 
@@ -283,7 +284,7 @@ final class MonitorViewModel: ObservableObject {
 
     private func appendDanmaku(user: String, text: String, colorHex: String) {
         let isSystem = user == "系统"
-        let color = isSystem ? Color(red: 1.0, green: 0.42, blue: 0.36) : Color(hex: colorHex)
+        let color = isSystem ? UIColor(red: 1.0, green: 0.42, blue: 0.36, alpha: 1) : UIColor(hex: colorHex)
         lines.append(DanmakuLine(user: user, text: text, color: color, isSystem: isSystem))
         if lines.count >= 500 {
             lines.removeFirst(400)
@@ -293,16 +294,23 @@ final class MonitorViewModel: ObservableObject {
 
 extension Color {
     init(hex: String) {
+        self = Color(UIColor(hex: hex))
+    }
+}
+
+extension UIColor {
+    convenience init(hex: String) {
         let cleaned = hex.trimmingCharacters(in: CharacterSet(charactersIn: "#")).uppercased()
         var value: UInt64 = 0
         guard cleaned.count == 6, Scanner(string: cleaned).scanHexInt64(&value) else {
-            self = Color(red: 0.91, green: 0.93, blue: 0.95)
+            self.init(red: 0.91, green: 0.93, blue: 0.95, alpha: 1)
             return
         }
-        self = Color(
-            red: Double((value & 0xFF0000) >> 16) / 255.0,
-            green: Double((value & 0x00FF00) >> 8) / 255.0,
-            blue: Double(value & 0x0000FF) / 255.0
+        self.init(
+            red: CGFloat((value & 0xFF0000) >> 16) / 255.0,
+            green: CGFloat((value & 0x00FF00) >> 8) / 255.0,
+            blue: CGFloat(value & 0x0000FF) / 255.0,
+            alpha: 1
         )
     }
 }

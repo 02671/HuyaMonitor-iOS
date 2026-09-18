@@ -4,8 +4,9 @@ import MediaPlayer
 @MainActor
 final class AudioPlayer {
 
-    static let refreshSec: TimeInterval = 120
+    static let refreshSec: TimeInterval = 90
     static let overlapSec: TimeInterval = 2.0
+    private static let sameLineLimit = 3
 
     var onStatus: ((_ text: String, _ ok: Bool) -> Void)?
     var onDiagnostic: ((String) -> Void)?
@@ -34,6 +35,11 @@ final class AudioPlayer {
     private var reconnectDelay: TimeInterval = 2.5
     private var loadTask: Task<Void, Never>?
     private var lastTitle: String?
+    private var sameLineFails = 0
+    private var currentRatio: Int?
+    private var lastRoom: HuyaRoom?
+    private var resigning = false
+    private var lastResignAt: TimeInterval = 0
 
     var isRunning: Bool { wanted }
     var isPlaying: Bool { player?.timeControlStatus == .playing }
@@ -46,9 +52,18 @@ final class AudioPlayer {
         self.roomId = roomId
         self.lineIndex = 0
         reconnectDelay = 2.5
+        sameLineFails = 0
+        currentRatio = nil
+        lastRoom = nil
+        resigning = false
         configureSession()
         configureRemoteCommands()
         observeInterruptions()
+        StreamProxy.shared.onUpstreamForbidden = { [weak self] in
+            Task { @MainActor in
+                self?.handleForbidden()
+            }
+        }
         onStatus?("音频连接中", false)
         open()
     }
@@ -71,6 +86,8 @@ final class AudioPlayer {
         player?.replaceCurrentItem(with: nil)
         player = nil
         dropOverlap()
+        StreamProxy.shared.onUpstreamForbidden = nil
+        resigning = false
         if notify {
             onStatus?("音频未连接", false)
         }
@@ -115,6 +132,7 @@ final class AudioPlayer {
         refreshItem?.cancel()
         refreshItem = nil
         loadTask?.cancel()
+        resigning = false
         onStatus?("音频连接中", false)
         loadTask = Task { await self.loadAndPlay(id: id, overlap: false) }
     }
@@ -126,22 +144,55 @@ final class AudioPlayer {
         loadTask = Task { await self.loadAndPlay(id: id, overlap: true) }
     }
 
+    private func handleForbidden() {
+        guard wanted else { return }
+        let now = Date().timeIntervalSince1970
+        if now - lastResignAt < 1.2 { return }
+        lastResignAt = now
+        onDiagnostic?("直播地址过期，正在重新签名")
+        resignSameLine()
+    }
+
+    private func resignSameLine() {
+        guard wanted else { return }
+        if resigning { return }
+        resigning = true
+        sameLineFails += 1
+        if sameLineFails >= Self.sameLineLimit {
+            bumpQualityOrLine()
+            sameLineFails = 0
+        }
+        token += 1
+        let id = token
+        reconnectItem?.cancel()
+        reconnectItem = nil
+        refreshItem?.cancel()
+        readyWatchdog?.cancel()
+        loadTask?.cancel()
+        onStatus?("音频重连中", false)
+        loadTask = Task { await self.loadAndPlay(id: id, overlap: false) }
+    }
+
     private func loadAndPlay(id: Int, overlap: Bool) async {
         guard wanted, id == token else { return }
         do {
             try await StreamProxy.shared.start()
             let room = try await HuyaAPI.fetchRoom(roomId)
-            let result = try await HuyaAPI.buildPlayURL(room, lineIndex: lineIndex)
+            lastRoom = room
+            let ratio = currentRatio ?? room.lowestBitRate ?? HuyaAPI.defaultBitRate
+            currentRatio = ratio
+            let result = try await HuyaAPI.buildPlayURL(room, lineIndex: lineIndex, ratio: ratio)
             lineIndex = result.lineIndex
             guard wanted, id == token else { return }
             attach(urlString: result.url, room: room, id: id, overlap: overlap)
         } catch {
             guard wanted, id == token else { return }
             if overlap {
+                resigning = false
                 onDiagnostic?(error.localizedDescription)
                 armRefresh(id: id)
             } else {
-                fail(id: id, reason: error.localizedDescription)
+                fail(id: id, reason: error.localizedDescription, expired: false)
             }
         }
     }
@@ -149,14 +200,14 @@ final class AudioPlayer {
     private func attach(urlString: String, room: HuyaRoom, id: Int, overlap: Bool) {
         guard wanted, id == token else { return }
         guard let httpsURL = URL(string: urlString) else {
-            fail(id: id, reason: "音频地址无效")
+            fail(id: id, reason: "音频地址无效", expired: false)
             return
         }
         let playURL: URL
         do {
             playURL = try StreamProxy.shared.playbackURL(from: httpsURL)
         } catch {
-            fail(id: id, reason: error.localizedDescription)
+            fail(id: id, reason: error.localizedDescription, expired: false)
             return
         }
 
@@ -214,9 +265,12 @@ final class AudioPlayer {
                     self.overlapItemObservation = nil
                     incoming.pause()
                     self.overlapPlayer = nil
-                    let reason = item.error?.localizedDescription ?? "换链失败"
-                    self.onDiagnostic?(reason)
-                    self.armRefresh(id: id)
+                    if Self.isExpired(item.error) {
+                        self.handleForbidden()
+                    } else {
+                        self.onDiagnostic?(Self.describe(item.error) ?? "换链失败")
+                        self.armRefresh(id: id)
+                    }
                 }
             }
         }
@@ -253,6 +307,8 @@ final class AudioPlayer {
                 }
                 incoming.play()
                 self.reconnectDelay = 2.5
+                self.sameLineFails = 0
+                self.resigning = false
                 self.onDiagnostic?("")
                 self.onStatus?("音频已连接", true)
                 self.armRefresh(id: id)
@@ -280,7 +336,7 @@ final class AudioPlayer {
                 guard let self, self.wanted, id == self.token else { return }
                 let status = self.player?.currentItem?.status
                 if status != .readyToPlay {
-                    self.fail(id: id, reason: "音频在限定时间内未能开始播放")
+                    self.fail(id: id, reason: "音频在限定时间内未能开始播放", expired: false)
                 }
             }
         }
@@ -300,8 +356,12 @@ final class AudioPlayer {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.refreshSec, execute: item)
     }
 
-    private func fail(id: Int, reason: String) {
+    private func fail(id: Int, reason: String, expired: Bool) {
         guard wanted, id == token else { return }
+        if expired {
+            handleForbidden()
+            return
+        }
         onDiagnostic?(reason)
         token += 1
         loadTask?.cancel()
@@ -315,9 +375,19 @@ final class AudioPlayer {
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         onStatus?("音频重连中", false)
-        lineIndex += 1
+        resigning = false
+        bumpQualityOrLine()
         scheduleReconnect(after: reconnectDelay)
         reconnectDelay = min(reconnectDelay * 1.5, 20)
+    }
+
+    private func bumpQualityOrLine() {
+        if let room = lastRoom, let current = currentRatio, let next = HuyaAPI.nextBitRate(in: room, after: current) {
+            currentRatio = next
+            return
+        }
+        lineIndex += 1
+        currentRatio = lastRoom?.lowestBitRate
     }
 
     private func scheduleReconnect(after delay: TimeInterval) {
@@ -342,14 +412,19 @@ final class AudioPlayer {
                     self.readyWatchdog?.cancel()
                     self.readyWatchdog = nil
                     self.reconnectDelay = 2.5
+                    self.sameLineFails = 0
+                    self.resigning = false
                     self.onDiagnostic?("")
                     self.onStatus?("音频已连接", true)
                     self.player?.play()
                     self.armRefresh(id: id)
                     self.updateNowPlaying()
                 case .failed:
-                    let reason = Self.describe(item.error) ?? "播放失败"
-                    self.fail(id: id, reason: reason)
+                    if Self.isExpired(item.error) {
+                        self.handleForbidden()
+                    } else {
+                        self.fail(id: id, reason: Self.describe(item.error) ?? "播放失败", expired: false)
+                    }
                 default:
                     break
                 }
@@ -371,13 +446,17 @@ final class AudioPlayer {
             Task { @MainActor in
                 guard let self, self.wanted, id == self.token else { return }
                 let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
-                self.fail(id: id, reason: Self.describe(error) ?? "播放中断")
+                if Self.isExpired(error) {
+                    self.handleForbidden()
+                } else {
+                    self.fail(id: id, reason: Self.describe(error) ?? "播放中断", expired: false)
+                }
             }
         }
         endedObserver = center.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.wanted, id == self.token else { return }
-                self.fail(id: id, reason: "音频流结束")
+                self.fail(id: id, reason: "音频流结束", expired: true)
             }
         }
         stallObserver = center.addObserver(forName: .AVPlayerItemPlaybackStalled, object: item, queue: .main) { [weak self] _ in
@@ -391,7 +470,9 @@ final class AudioPlayer {
                 guard let self, self.wanted, id == self.token else { return }
                 if let last = item.errorLog()?.events.last {
                     let comment = last.errorComment ?? last.errorDomain
-                    if !comment.isEmpty {
+                    if Self.looksExpired(comment) {
+                        self.handleForbidden()
+                    } else if !comment.isEmpty {
                         self.onDiagnostic?(comment)
                     }
                 }
@@ -399,8 +480,28 @@ final class AudioPlayer {
         }
     }
 
+    private static func isExpired(_ error: Error?) -> Bool {
+        guard let error else { return false }
+        let ns = error as NSError
+        if ns.code == -12660 { return true }
+        if ns.code == 403 { return true }
+        return looksExpired(error.localizedDescription)
+    }
+
+    private static func looksExpired(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        if lower.contains("403") { return true }
+        if lower.contains("forbidden") { return true }
+        if lower.contains("permission") { return true }
+        if lower.contains("cannot open") { return true }
+        return false
+    }
+
     private static func describe(_ error: Error?) -> String? {
         guard let error else { return nil }
+        if isExpired(error) {
+            return "直播地址过期，正在重新签名"
+        }
         let ns = error as NSError
         if ns.domain == "CoreMediaErrorDomain" && ns.code == -12881 {
             return "播放器拒绝自定义地址的分片（已改为本地代理）"

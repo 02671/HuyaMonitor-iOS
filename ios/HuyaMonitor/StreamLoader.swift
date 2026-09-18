@@ -13,11 +13,14 @@ final class StreamProxy {
 
     static let shared = StreamProxy()
 
+    var onUpstreamForbidden: (() -> Void)?
+
     private let queue = DispatchQueue(label: "huya.stream.proxy")
     private let session: URLSession
     private var listener: NWListener?
     private var port: UInt16 = 0
     private var startWaiters: [CheckedContinuation<Void, Error>] = []
+    private var lastForbiddenAt: TimeInterval = 0
 
     private init() {
         let config = URLSessionConfiguration.ephemeral
@@ -58,14 +61,14 @@ final class StreamProxy {
     }
 
     private func makePlaybackURL(from httpsURL: URL, port: UInt16) throws -> URL {
-        var parts = URLComponents()
-        parts.scheme = "http"
-        parts.host = "127.0.0.1"
-        parts.port = Int(port)
-        parts.path = "/"
-        parts.queryItems = [URLQueryItem(name: "u", value: httpsURL.absoluteString)]
-        guard let url = parts.url, port > 0 else {
+        guard port > 0 else {
             throw HuyaError.message("音频代理未启动")
+        }
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        let encoded = httpsURL.absoluteString.addingPercentEncoding(withAllowedCharacters: allowed) ?? httpsURL.absoluteString
+        guard let url = URL(string: "http://127.0.0.1:\(port)/p?u=\(encoded)") else {
+            throw HuyaError.message("音频代理地址无效")
         }
         return url
     }
@@ -203,6 +206,11 @@ final class StreamProxy {
         }
         let http = response as? HTTPURLResponse
         let status = http?.statusCode ?? 200
+        if status == 403 {
+            notifyForbidden()
+            reply(connection, status: 403, reason: "Forbidden", body: data, contentType: "text/plain")
+            return
+        }
         if status >= 400 {
             reply(connection, status: status, reason: "Upstream", body: data, contentType: "text/plain")
             return
@@ -229,6 +237,15 @@ final class StreamProxy {
             extra["Accept-Ranges"] = accept
         }
         reply(connection, status: status, reason: status == 206 ? "Partial Content" : "OK", body: data, contentType: contentType, extra: extra)
+    }
+
+    private func notifyForbidden() {
+        let now = Date().timeIntervalSince1970
+        if now - lastForbiddenAt < 1.5 { return }
+        lastForbiddenAt = now
+        DispatchQueue.main.async { [weak self] in
+            self?.onUpstreamForbidden?()
+        }
     }
 
     private func reply(
@@ -326,14 +343,40 @@ final class StreamProxy {
     }
 
     private func rewriteURLString(_ value: String, playlistURL: URL) -> String {
-        let resolved: URL?
-        if let absolute = URL(string: value), absolute.scheme != nil {
-            resolved = absolute
-        } else {
-            resolved = URL(string: value, relativeTo: playlistURL)?.absoluteURL
-        }
-        guard let resolved else { return value }
+        guard let resolved = resolve(value, against: playlistURL) else { return value }
         return (try? makePlaybackURL(from: httpsify(resolved), port: port))?.absoluteString ?? value
+    }
+
+    private func resolve(_ value: String, against playlistURL: URL) -> URL? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil }
+        if let absolute = URL(string: trimmed), let scheme = absolute.scheme, scheme == "http" || scheme == "https" {
+            return absolute
+        }
+        var pathPart = trimmed
+        var extraQuery: String?
+        if let q = trimmed.firstIndex(of: "?") {
+            pathPart = String(trimmed[..<q])
+            extraQuery = String(trimmed[trimmed.index(after: q)...])
+        }
+        guard var parts = URLComponents(url: playlistURL, resolvingAgainstBaseURL: false) else {
+            return URL(string: trimmed, relativeTo: playlistURL)?.absoluteURL
+        }
+        if pathPart.hasPrefix("/") {
+            parts.path = pathPart
+        } else {
+            var directory = parts.path
+            if let slash = directory.lastIndex(of: "/") {
+                directory = String(directory[...slash])
+            } else {
+                directory = "/"
+            }
+            parts.path = directory + pathPart
+        }
+        if let extraQuery, !extraQuery.isEmpty {
+            parts.percentEncodedQuery = extraQuery
+        }
+        return parts.url
     }
 
     private func httpsify(_ url: URL) -> URL {
