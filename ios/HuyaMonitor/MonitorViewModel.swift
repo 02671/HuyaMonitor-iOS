@@ -39,6 +39,7 @@ final class MonitorViewModel: ObservableObject {
     @Published var audioTitle = ""
     @Published var audioQuality = ""
     @Published var danmakuDiagnostic = ""
+    @Published var audioDiagnostic = ""
 
     private let danmaku = DanmakuClient()
     private let audio = AudioPlayer()
@@ -77,6 +78,11 @@ final class MonitorViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.audioPhase = self.phase(of: text, ok: ok)
+            }
+        }
+        audio.onDiagnostic = { [weak self] reason in
+            Task { @MainActor in
+                self?.audioDiagnostic = reason
             }
         }
     }
@@ -160,6 +166,7 @@ final class MonitorViewModel: ObservableObject {
             audioPhase = .off
             audioTitle = ""
             audioQuality = ""
+            audioDiagnostic = ""
             return
         }
         let roomId: String

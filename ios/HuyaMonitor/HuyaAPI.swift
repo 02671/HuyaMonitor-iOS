@@ -14,6 +14,8 @@ enum HuyaAPI {
         return [
             "User-Agent": playUA,
             "Referer": "https://www.huya.com/",
+            "Origin": "https://www.huya.com",
+            "Accept": "*/*",
         ]
     }
 

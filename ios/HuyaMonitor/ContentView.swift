@@ -191,6 +191,18 @@ struct ContentView: View {
                     Spacer()
                 }
             }
+
+            if !viewModel.audioDiagnostic.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundColor(Theme.danger)
+                    Text("音频诊断：\(viewModel.audioDiagnostic)")
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.muted)
+                        .lineLimit(2)
+                    Spacer()
+                }
+            }
         }
         .padding(12)
         .background(Theme.panel)

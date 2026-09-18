@@ -5,21 +5,30 @@ import MediaPlayer
 final class AudioPlayer {
 
     var onStatus: ((_ text: String, _ ok: Bool) -> Void)?
+    var onDiagnostic: ((String) -> Void)?
 
     private var player: AVPlayer?
-    private var refreshTimer: Timer?
     private var itemObservation: NSKeyValueObservation?
+    private var controlObservation: NSKeyValueObservation?
     private var failureObserver: NSObjectProtocol?
+    private var endedObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
+    private var errorLogObserver: NSObjectProtocol?
+    private var interruptionObserver: NSObjectProtocol?
     private var remoteCommandsConfigured = false
+
+    private let loader = StreamLoader()
+    private let loaderQueue = DispatchQueue(label: "huya.audio.resource")
 
     private var roomId = ""
     private var lineIndex = 0
-    private var generation = 0
+    private var token = 0
     private var wanted = false
     private var volume: Float = 1.0
-
-    private let refreshInterval: TimeInterval = 300
+    private var reconnectItem: DispatchWorkItem?
+    private var readyWatchdog: DispatchWorkItem?
+    private var reconnectDelay: TimeInterval = 2.5
+    private var loadTask: Task<Void, Never>?
 
     var isRunning: Bool { wanted }
     var isPlaying: Bool { player?.timeControlStatus == .playing }
@@ -29,26 +38,28 @@ final class AudioPlayer {
     func start(roomId: String) {
         stop(notify: false)
         wanted = true
-        generation += 1
         self.roomId = roomId
         self.lineIndex = 0
+        reconnectDelay = 2.5
         configureSession()
         configureRemoteCommands()
+        observeInterruptions()
         onStatus?("音频连接中", false)
-        let gen = generation
-        Task { await self.loadAndPlay(generation: gen) }
+        open()
     }
 
     func stop(notify: Bool = true) {
         wanted = false
-        generation += 1
-        refreshTimer?.invalidate()
-        refreshTimer = nil
-        itemObservation = nil
-        removeObservers()
+        token += 1
+        loadTask?.cancel()
+        loadTask = nil
+        reconnectItem?.cancel()
+        reconnectItem = nil
+        readyWatchdog?.cancel()
+        readyWatchdog = nil
+        teardownItem()
         player?.pause()
         player?.replaceCurrentItem(with: nil)
-        player = nil
         if notify {
             onStatus?("音频未连接", false)
         }
@@ -61,9 +72,8 @@ final class AudioPlayer {
 
     func ensurePlaying() {
         guard wanted else { return }
-        if player == nil {
-            let gen = generation
-            Task { await self.loadAndPlay(generation: gen) }
+        if player?.currentItem == nil {
+            open()
         } else if player?.timeControlStatus != .playing {
             player?.play()
             updateNowPlaying()
@@ -82,125 +92,213 @@ final class AudioPlayer {
 
     // MARK: - Loading
 
-    private func loadAndPlay(generation gen: Int) async {
-        guard wanted, gen == generation else { return }
+    private func open() {
+        guard wanted else { return }
+        token += 1
+        let id = token
+        reconnectItem?.cancel()
+        reconnectItem = nil
+        readyWatchdog?.cancel()
+        readyWatchdog = nil
+        loadTask?.cancel()
+        onStatus?("音频连接中", false)
+        loadTask = Task { await self.loadAndPlay(id: id) }
+    }
+
+    private func loadAndPlay(id: Int) async {
+        guard wanted, id == token else { return }
         do {
             let room = try await HuyaAPI.fetchRoom(roomId)
             let result = try await HuyaAPI.buildPlayURL(room, lineIndex: lineIndex)
             lineIndex = result.lineIndex
-            guard wanted, gen == generation else { return }
-            replaceItem(urlString: result.url, room: room, generation: gen)
+            guard wanted, id == token else { return }
+            replaceItem(urlString: result.url, room: room, id: id)
         } catch {
-            guard wanted, gen == generation else { return }
-            onStatus?("音频重连中", false)
-            scheduleReload(generation: gen, delay: 3, advanceLine: true)
+            guard wanted, id == token else { return }
+            fail(id: id, reason: error.localizedDescription)
         }
     }
 
-    private func replaceItem(urlString: String, room: HuyaRoom, generation gen: Int) {
-        guard let url = URL(string: urlString) else {
-            scheduleReload(generation: gen, delay: 2, advanceLine: true)
+    private func replaceItem(urlString: String, room: HuyaRoom, id: Int) {
+        guard wanted, id == token else { return }
+        guard let httpsURL = URL(string: urlString) else {
+            fail(id: id, reason: "音频地址无效")
             return
         }
-        let options: [String: Any] = ["AVURLAssetHTTPHeaderFieldsKey": HuyaAPI.playbackHeaders]
-        let asset = AVURLAsset(url: url, options: options)
-        let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = 2
-        // Belt and braces: `ratio` pins the CDN rendition, and this caps HLS variant
-        // selection so AVPlayer cannot quietly upgrade to a higher-bitrate rendition.
-        if let lowest = room.lowestBitRate, lowest > 0 {
-            item.preferredPeakBitRate = Double(lowest) * 1200
-        }
+        let playURL = StreamLoader.playbackURL(from: httpsURL)
+        let asset = AVURLAsset(url: playURL)
+        asset.resourceLoader.setDelegate(loader, queue: loaderQueue)
 
-        if let player {
-            player.replaceCurrentItem(with: item)
-        } else {
+        let item = AVPlayerItem(asset: asset)
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        item.preferredForwardBufferDuration = 8
+
+        teardownItem()
+        if player == nil {
             let newPlayer = AVPlayer(playerItem: item)
             newPlayer.automaticallyWaitsToMinimizeStalling = true
             player = newPlayer
+        } else {
+            player?.replaceCurrentItem(with: item)
         }
         player?.volume = volume
-        observe(item: item, generation: gen)
+        observe(item: item, id: id)
         player?.play()
-        onStatus?("音频已连接", true)
         let title = room.nick.isEmpty ? room.title : room.nick
         updateNowPlaying(title: title.isEmpty ? nil : title)
-        scheduleRefresh(generation: gen)
+        armReadyWatchdog(id: id)
     }
 
-    private func scheduleRefresh(generation gen: Int) {
-        refreshTimer?.invalidate()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: false) { [weak self] _ in
+    private func armReadyWatchdog(id: Int) {
+        readyWatchdog?.cancel()
+        let item = DispatchWorkItem { [weak self] in
             Task { @MainActor in
-                guard let self, self.wanted, gen == self.generation else { return }
-                await self.loadAndPlay(generation: gen)
+                guard let self, self.wanted, id == self.token else { return }
+                let status = self.player?.currentItem?.status
+                if status != .readyToPlay {
+                    self.fail(id: id, reason: "音频在限定时间内未能开始播放")
+                }
             }
         }
+        readyWatchdog = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25, execute: item)
     }
 
-    private func scheduleReload(generation gen: Int, delay: TimeInterval, advanceLine: Bool) {
-        if advanceLine {
-            lineIndex += 1
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+    private func fail(id: Int, reason: String) {
+        guard wanted, id == token else { return }
+        onDiagnostic?(reason)
+        token += 1
+        loadTask?.cancel()
+        loadTask = nil
+        readyWatchdog?.cancel()
+        readyWatchdog = nil
+        teardownItem()
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        onStatus?("音频重连中", false)
+        lineIndex += 1
+        scheduleReconnect(after: reconnectDelay)
+        reconnectDelay = min(reconnectDelay * 1.5, 20)
+    }
+
+    private func scheduleReconnect(after delay: TimeInterval) {
+        guard wanted, reconnectItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
             Task { @MainActor in
-                guard let self, self.wanted, gen == self.generation else { return }
-                await self.loadAndPlay(generation: gen)
+                guard let self, self.wanted else { return }
+                self.reconnectItem = nil
+                self.open()
             }
         }
+        reconnectItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
-    private func observe(item: AVPlayerItem, generation gen: Int) {
-        removeObservers()
+    private func observe(item: AVPlayerItem, id: Int) {
         itemObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-            guard item.status == .failed else { return }
             Task { @MainActor in
-                guard let self, self.wanted, gen == self.generation else { return }
-                self.onStatus?("音频重连中", false)
-                self.scheduleReload(generation: gen, delay: 1.5, advanceLine: true)
+                guard let self, self.wanted, id == self.token else { return }
+                switch item.status {
+                case .readyToPlay:
+                    self.readyWatchdog?.cancel()
+                    self.readyWatchdog = nil
+                    self.reconnectDelay = 2.5
+                    self.onDiagnostic?("")
+                    self.onStatus?("音频已连接", true)
+                    self.player?.play()
+                    self.updateNowPlaying()
+                case .failed:
+                    let reason = item.error?.localizedDescription ?? "播放失败"
+                    self.fail(id: id, reason: reason)
+                default:
+                    break
+                }
+            }
+        }
+        controlObservation = player?.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+            Task { @MainActor in
+                guard let self, self.wanted, id == self.token else { return }
+                self.updateNowPlaying()
+                if player.timeControlStatus == .playing {
+                    self.readyWatchdog?.cancel()
+                    self.readyWatchdog = nil
+                    self.onStatus?("音频已连接", true)
+                }
             }
         }
         let center = NotificationCenter.default
-        failureObserver = center.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: nil) { [weak self] _ in
+        failureObserver = center.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main) { [weak self] note in
             Task { @MainActor in
-                guard let self, self.wanted, gen == self.generation else { return }
-                self.onStatus?("音频重连中", false)
-                self.scheduleReload(generation: gen, delay: 1.5, advanceLine: true)
+                guard let self, self.wanted, id == self.token else { return }
+                let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+                self.fail(id: id, reason: error?.localizedDescription ?? "播放中断")
             }
         }
-        stallObserver = center.addObserver(forName: .AVPlayerItemPlaybackStalled, object: item, queue: nil) { [weak self] _ in
+        endedObserver = center.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
             Task { @MainActor in
-                guard let self, self.wanted, gen == self.generation else { return }
+                guard let self, self.wanted, id == self.token else { return }
+                self.fail(id: id, reason: "音频流结束")
+            }
+        }
+        stallObserver = center.addObserver(forName: .AVPlayerItemPlaybackStalled, object: item, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.wanted, id == self.token else { return }
                 self.player?.play()
             }
         }
+        errorLogObserver = center.addObserver(forName: .AVPlayerItemNewErrorLogEntry, object: item, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.wanted, id == self.token else { return }
+                if let last = item.errorLog()?.events.last {
+                    let comment = last.errorComment ?? last.errorDomain
+                    if !comment.isEmpty {
+                        self.onDiagnostic?(comment)
+                    }
+                }
+            }
+        }
     }
 
-    private func removeObservers() {
+    private func teardownItem() {
+        itemObservation = nil
+        controlObservation = nil
         let center = NotificationCenter.default
-        if let failureObserver {
-            center.removeObserver(failureObserver)
-            self.failureObserver = nil
-        }
-        if let stallObserver {
-            center.removeObserver(stallObserver)
-            self.stallObserver = nil
-        }
+        if let failureObserver { center.removeObserver(failureObserver); self.failureObserver = nil }
+        if let endedObserver { center.removeObserver(endedObserver); self.endedObserver = nil }
+        if let stallObserver { center.removeObserver(stallObserver); self.stallObserver = nil }
+        if let errorLogObserver { center.removeObserver(errorLogObserver); self.errorLogObserver = nil }
     }
 
-    // MARK: - Background audio session
+    // MARK: - Session
 
     private func configureSession() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playback, mode: .moviePlayback, options: [])
+            try session.setCategory(.playback, mode: .default, options: [])
             try session.setActive(true)
         } catch {
-            // Foreground playback still works; the .playback category is what enables lock-screen audio.
+            onDiagnostic?(error.localizedDescription)
         }
     }
 
-    // MARK: - Lock screen controls
+    private func observeInterruptions() {
+        guard interruptionObserver == nil else { return }
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] note in
+            Task { @MainActor in
+                guard let self, self.wanted else { return }
+                let typeValue = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+                let type = typeValue.flatMap(AVAudioSession.InterruptionType.init(rawValue:))
+                if type == .ended {
+                    try? AVAudioSession.sharedInstance().setActive(true)
+                    self.player?.play()
+                }
+            }
+        }
+    }
 
     private func configureRemoteCommands() {
         guard !remoteCommandsConfigured else { return }

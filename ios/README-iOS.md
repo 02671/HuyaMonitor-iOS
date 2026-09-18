@@ -10,9 +10,9 @@
 | 按主播名搜索 | `HuyaAPI.searchAnchors`（`search.cdn.huya.com`），开播的排前面并显示绿色 |
 | 弹幕（TARS 协议 WebSocket） | `Tars.swift` + `DanmakuClient.swift`，基于 Network.framework 自建 WebSocket 连接 `cdnws.api.huya.com:443`，30 秒心跳，断线自动重连（单飞 + 退避，上限 30 秒） |
 | 贵族弹幕颜色 | `DanmakuClient.parseChat` 读取颜色字段，`Color(hex:)` 渲染 |
-| 音频播放（原版 ffplay） | `AudioPlayer.swift` 使用 AVPlayer 播放 HLS 流 |
-| 省流量 | 自动读取虎牙画质列表 `rateArray`，固定使用最低画质「流畅」（如 500 kbps），并给 AVPlayer 设置 `preferredPeakBitRate` 上限，避免自动升到高码率 |
-| 音频直链过期自动续播 | 每 300 秒重新签名换链；播放失败/卡顿立即换线重连 |
+| 音频播放（原版 ffplay） | `AudioPlayer.swift` + `StreamLoader.swift`：AVPlayer 播放 HLS，所有播放列表和分片请求都带浏览器 UA/Referer，避免 CDN 403 |
+| 省流量 | 自动读取虎牙画质列表 `rateArray`，固定使用最低画质「流畅」（如 500 kbps） |
+| 音频失败自动续播 | 单飞重连 + 退避换线；真正播放失败、流结束或 25 秒内未就绪才重连，避免连环风暴 |
 | 独立开关弹幕 / 音频 | 「弹幕」「音频」两个独立按钮 |
 | 历史房号 + 删除 | `RoomHistoryStore`，存到 App 沙盒 `Documents/history.json` |
 | 清屏 / 音量 / 置顶 / 隐藏 | 清屏、音量保留；置顶与悬浮隐藏属于桌面端窗口概念，iOS 不需要 |
@@ -34,7 +34,7 @@
 
 - 原版播放的是 FLV 流，AVPlayer 不支持 FLV。iOS 版优先使用同房间的 **HLS（m3u8）** 地址，这也是 iOS 上能实现后台播放的前提。签名算法（`processAnticode`）与原版完全一致，只是把 `sFlvUrl` 换成了 `sHlsUrl`。若房间确实只提供 FLV，音频会连接失败并自动重试。
 - 画质由 `ratio` 参数决定，其取值就是画质列表里的 `iBitRate`。`ratio` 不参与 `wsSecret` 签名计算，所以修改它不会让链接失效。
-- 所有网络请求的 UA / Referer 与原版保持一致。
+- 所有网络请求的 UA / Referer 与原版保持一致。音频走自定义 `hyhls://` 协议，由 `StreamLoader` 转回 HTTPS 并给每一段请求补上 `User-Agent`、`Referer`、`Origin`。AVPlayer 对普通 `https://` 地址只会给首个播放列表带头，后续 TS 分片会变成 `AppleCoreMedia`，虎牙 CDN 会 403，表现为音频反复断开重连。
 - 弹幕 TARS 编解码为逐行移植，字段号、心跳包、URI 1400 均未改动。
 - 弹幕没有使用 `URLSessionWebSocketTask`，而是基于 `Network.framework` 自建了极简 WebSocket 客户端。原因是 `URLSessionWebSocketTask` 在升级请求里会带上 `Sec-WebSocket-Extensions: permessage-deflate`，虎牙 CDN 接受后会下发 RSV1 压缩帧，而 iOS 的 WebSocket 层处理这些帧时报 EPROTO（界面上表现为「Protocol error」）。自建客户端不发送该扩展头，服务器就不会启用压缩，帧始终是明文。这一点已用底层 socket 实测确认：不协商压缩时连续 70 余秒内所有帧 `rsv1=0`；协商压缩后服务器立刻开始发送 RSV1 帧。
 - 弹幕重连采用「单飞」模型：每次连接分配一个 token，所有异步回调都会校验 token，拆除连接时先递增 token 再取消任务，避免重连风暴。断线后按 1.5 倍退避重连，成功握手即重置为 2.5 秒。
@@ -80,7 +80,8 @@ ios/
 │   ├── HuyaAPI.swift               房间/搜索/匿名 uid/签名/HLS 地址
 │   ├── Tars.swift                  TARS 协议编解码
 │   ├── DanmakuClient.swift         弹幕 WebSocket 客户端
-│   ├── AudioPlayer.swift           AVPlayer 音频 + 后台播放 + 自动换链
+│   ├── AudioPlayer.swift           AVPlayer 音频 + 后台播放 + 单飞重连
+│   ├── StreamLoader.swift          hyhls 资源加载，给每个 HLS 分片补浏览器头
 │   ├── RoomHistoryStore.swift      历史房号持久化
 │   ├── MonitorViewModel.swift      状态与业务编排
 │   ├── ContentView.swift           主界面
