@@ -199,7 +199,7 @@ final class MonitorViewModel: ObservableObject {
     private func startAudio(room: HuyaRoom) {
         audioWanted = true
         audioTitle = room.nick.isEmpty ? room.title : room.nick
-        audioQuality = room.lowestQuality?.name ?? ""
+        audioQuality = room.qualities.first(where: { $0.bitRate == HuyaAPI.defaultBitRate })?.name ?? ""
         audio.start(roomId: room.roomId)
         audio.setVolume(volume)
     }

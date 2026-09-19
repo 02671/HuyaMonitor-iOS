@@ -10,9 +10,9 @@
 | 按主播名搜索 | `HuyaAPI.searchAnchors`（`search.cdn.huya.com`），开播的排前面并显示绿色 |
 | 弹幕（TARS 协议 WebSocket） | `Tars.swift` + `DanmakuClient.swift`，基于 Network.framework 自建 WebSocket 连接 `cdnws.api.huya.com:443`，30 秒心跳，断线自动重连（单飞 + 退避，上限 30 秒） |
 | 贵族弹幕颜色 | `DanmakuClient.parseChat` 读取颜色字段，`Color(hex:)` 渲染 |
-| 音频播放（原版 ffplay） | `AudioPlayer.swift` + `StreamProxy`：AVPlayer 播 HLS，本机 HTTP 反代给每个播放列表和分片补浏览器 UA/Referer，避免 CDN 403 |
-| 省流量 | 自动读取虎牙画质列表 `rateArray`，固定使用最低画质「流畅」（如 500 kbps） |
-| 音频换链 | 播放中每 90 秒重叠换链；403 / 地址过期时在同一条线立刻重签，连续失败再升一档画质或换线 |
+| 音频播放（原版 ffplay） | `AudioPlayer.swift` + `StreamProxy`：按 Windows 版循环拉流，系统 `AVPlayer` 播 HLS；本机 HTTP 反代给每个播放列表和分片补浏览器 UA/Referer，避免 CDN 403 |
+| 画质 | 与 Windows 版一致，固定 `ratio=2000`（超清） |
+| 音频换链 | 与 Windows 版一致：播放中每 120 秒重叠 2 秒换链；进程/播放失败则换线路重连 |
 | 独立开关弹幕 / 音频 | 「弹幕」「音频」两个独立按钮 |
 | 历史房号 + 删除 | `RoomHistoryStore`，存到 App 沙盒 `Documents/history.json` |
 | 清屏 / 音量 / 置顶 / 隐藏 | 清屏、音量保留；置顶与悬浮隐藏属于桌面端窗口概念，iOS 不需要 |
@@ -80,7 +80,7 @@ ios/
 │   ├── HuyaAPI.swift               房间/搜索/匿名 uid/签名/HLS 地址
 │   ├── Tars.swift                  TARS 协议编解码
 │   ├── DanmakuClient.swift         弹幕 WebSocket 客户端
-│   ├── AudioPlayer.swift           AVPlayer 音频 + 后台播放 + 120 秒换链重叠
+│   ├── AudioPlayer.swift           系统 AVPlayer 音频 + 后台播放 + 120 秒重叠换链
 │   ├── StreamLoader.swift          本机 HTTP 反代，给每个 HLS 分片补浏览器头
 │   ├── RoomHistoryStore.swift      历史房号持久化
 │   ├── MonitorViewModel.swift      状态与业务编排

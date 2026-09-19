@@ -4,9 +4,8 @@ import MediaPlayer
 @MainActor
 final class AudioPlayer {
 
-    static let refreshSec: TimeInterval = 90
+    static let refreshSec: TimeInterval = 120
     static let overlapSec: TimeInterval = 2.0
-    private static let sameLineLimit = 3
 
     var onStatus: ((_ text: String, _ ok: Bool) -> Void)?
     var onDiagnostic: ((String) -> Void)?
@@ -14,89 +13,50 @@ final class AudioPlayer {
     private var player: AVPlayer?
     private var overlapPlayer: AVPlayer?
     private var itemObservation: NSKeyValueObservation?
-    private var controlObservation: NSKeyValueObservation?
-    private var overlapItemObservation: NSKeyValueObservation?
-    private var failureObserver: NSObjectProtocol?
     private var endedObserver: NSObjectProtocol?
+    private var failureObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
-    private var errorLogObserver: NSObjectProtocol?
     private var interruptionObserver: NSObjectProtocol?
     private var remoteCommandsConfigured = false
 
     private var roomId = ""
     private var lineIndex = 0
-    private var token = 0
+    private var gen = 0
     private var wanted = false
     private var volume: Float = 1.0
-    private var reconnectItem: DispatchWorkItem?
-    private var readyWatchdog: DispatchWorkItem?
-    private var refreshItem: DispatchWorkItem?
-    private var overlapItem: DispatchWorkItem?
-    private var reconnectDelay: TimeInterval = 2.5
-    private var loadTask: Task<Void, Never>?
+    private var loopTask: Task<Void, Never>?
     private var lastTitle: String?
-    private var sameLineFails = 0
-    private var currentRatio: Int?
-    private var lastRoom: HuyaRoom?
-    private var resigning = false
-    private var lastResignAt: TimeInterval = 0
-    private var sessionId = 0
+    private var currentDead = false
 
     var isRunning: Bool { wanted }
     var isPlaying: Bool { player?.timeControlStatus == .playing }
 
-    // MARK: - Control
-
     func start(roomId: String) {
         stop(notify: false)
         wanted = true
-        sessionId += 1
-        let sid = sessionId
+        gen += 1
+        let currentGen = gen
         self.roomId = roomId
         self.lineIndex = 0
-        reconnectDelay = 2.5
-        sameLineFails = 0
-        currentRatio = nil
-        lastRoom = nil
-        resigning = false
-        lastResignAt = 0
+        currentDead = false
+        lastTitle = nil
         configureSession()
         configureRemoteCommands()
         observeInterruptions()
         StreamProxy.shared.resetForNewSession()
-        StreamProxy.shared.onUpstreamForbidden = { [weak self] in
-            Task { @MainActor in
-                guard let self, self.wanted, self.sessionId == sid else { return }
-                self.handleForbidden()
-            }
-        }
         onStatus?("音频连接中", false)
-        open()
+        loopTask = Task { await self.runLoop(gen: currentGen) }
     }
 
     func stop(notify: Bool = true) {
         wanted = false
-        sessionId += 1
-        token += 1
-        loadTask?.cancel()
-        loadTask = nil
-        reconnectItem?.cancel()
-        reconnectItem = nil
-        readyWatchdog?.cancel()
-        readyWatchdog = nil
-        refreshItem?.cancel()
-        refreshItem = nil
-        overlapItem?.cancel()
-        overlapItem = nil
-        teardownItem()
-        player?.pause()
-        player?.replaceCurrentItem(with: nil)
-        player = nil
-        dropOverlap()
-        StreamProxy.shared.onUpstreamForbidden = nil
+        gen += 1
+        loopTask?.cancel()
+        loopTask = nil
+        dropPlayers()
         StreamProxy.shared.stop()
-        resigning = false
-        lastResignAt = 0
+        currentDead = false
+        lastTitle = nil
         if notify {
             onStatus?("音频未连接", false)
         }
@@ -110,9 +70,9 @@ final class AudioPlayer {
 
     func ensurePlaying() {
         guard wanted else { return }
-        if player?.currentItem == nil {
-            open()
-        } else if player?.timeControlStatus != .playing {
+        configureSession()
+        if player?.currentItem == nil { return }
+        if player?.timeControlStatus != .playing {
             player?.play()
             updateNowPlaying()
         }
@@ -128,411 +88,210 @@ final class AudioPlayer {
         updateNowPlaying()
     }
 
-    // MARK: - Loading
-
-    private func open() {
-        guard wanted else { return }
-        token += 1
-        let id = token
-        reconnectItem?.cancel()
-        reconnectItem = nil
-        readyWatchdog?.cancel()
-        readyWatchdog = nil
-        refreshItem?.cancel()
-        refreshItem = nil
-        loadTask?.cancel()
-        resigning = false
-        StreamProxy.shared.bumpGeneration()
-        onStatus?("音频连接中", false)
-        loadTask = Task { await self.loadAndPlay(id: id, overlap: false) }
-    }
-
-    private func refresh() {
-        guard wanted else { return }
-        let id = token
-        loadTask?.cancel()
-        loadTask = Task { await self.loadAndPlay(id: id, overlap: true) }
-    }
-
-    private func handleForbidden() {
-        guard wanted else { return }
-        guard !resigning else { return }
-        let now = Date().timeIntervalSince1970
-        if now - lastResignAt < 1.2 { return }
-        lastResignAt = now
-        onDiagnostic?("直播地址过期，正在重新签名")
-        resignSameLine()
-    }
-
-    private func resignSameLine() {
-        guard wanted else { return }
-        if resigning { return }
-        resigning = true
-        sameLineFails += 1
-        if sameLineFails >= Self.sameLineLimit {
-            bumpQualityOrLine()
-            sameLineFails = 0
-        }
-        token += 1
-        let id = token
-        reconnectItem?.cancel()
-        reconnectItem = nil
-        refreshItem?.cancel()
-        readyWatchdog?.cancel()
-        loadTask?.cancel()
-        StreamProxy.shared.bumpGeneration()
-        onStatus?("音频重连中", false)
-        loadTask = Task { await self.loadAndPlay(id: id, overlap: false) }
-    }
-
-    private func loadAndPlay(id: Int, overlap: Bool) async {
-        guard wanted, id == token else { return }
-        do {
-            try await StreamProxy.shared.start()
-            let room = try await HuyaAPI.fetchRoom(roomId)
-            lastRoom = room
-            let ratio = currentRatio ?? room.lowestBitRate ?? HuyaAPI.defaultBitRate
-            currentRatio = ratio
-            let result = try await HuyaAPI.buildPlayURL(room, lineIndex: lineIndex, ratio: ratio)
-            lineIndex = result.lineIndex
-            guard wanted, id == token else { return }
-            attach(urlString: result.url, room: room, id: id, overlap: overlap)
-            if wanted, id == token {
-                resigning = false
-            }
-        } catch {
-            guard wanted, id == token else { return }
-            if overlap {
-                resigning = false
+    private func runLoop(gen currentGen: Int) async {
+        var fail = 0
+        var first = true
+        while wanted, currentGen == gen, !Task.isCancelled {
+            do {
+                if first {
+                    onStatus?("音频连接中", false)
+                }
+                try await StreamProxy.shared.start()
+                let room = try await HuyaAPI.fetchRoom(roomId)
+                let result = try await HuyaAPI.buildPlayURL(room, lineIndex: lineIndex, ratio: HuyaAPI.defaultBitRate)
+                lineIndex = result.lineIndex
+                guard wanted, currentGen == gen else { return }
+                let incoming = try makePlayer(urlString: result.url, title: room.nick.isEmpty ? room.title : room.nick)
+                incoming.play()
+                guard wanted, currentGen == gen else {
+                    incoming.pause()
+                    incoming.replaceCurrentItem(with: nil)
+                    return
+                }
+                let leftover = swap(incoming)
+                fail = 0
+                first = false
+                currentDead = false
+                onDiagnostic?("")
+                onStatus?("音频已连接", true)
+                updateNowPlaying(title: lastTitle)
+                if leftover != nil {
+                    if await shouldStop(after: Self.overlapSec, gen: currentGen) { return }
+                    killOverlap()
+                }
+                let started = Date()
+                var died = false
+                while wanted, currentGen == gen, !Task.isCancelled {
+                    if isDead(player) || currentDead {
+                        died = true
+                        break
+                    }
+                    if Date().timeIntervalSince(started) >= Self.refreshSec {
+                        break
+                    }
+                    if await shouldStop(after: 0.35, gen: currentGen) { return }
+                }
+                guard wanted, currentGen == gen else { return }
+                if died {
+                    clearIfCurrent(player)
+                    onStatus?("音频重连中", false)
+                    lineIndex += 1
+                    if await shouldStop(after: 0.4, gen: currentGen) { return }
+                }
+            } catch {
+                guard wanted, currentGen == gen else { return }
+                fail += 1
+                if !hasPlayingProcess {
+                    onStatus?("音频重连中", false)
+                }
                 onDiagnostic?(error.localizedDescription)
-                armRefresh(id: id)
-            } else {
-                fail(id: id, reason: error.localizedDescription, expired: false)
+                lineIndex += 1
+                first = false
+                let delay = min(8.0, 1.2 * Double(fail))
+                if await shouldStop(after: delay, gen: currentGen) { return }
             }
+        }
+        if currentGen == gen {
+            wanted = false
+            dropPlayers()
+            onStatus?("音频未连接", false)
         }
     }
 
-    private func attach(urlString: String, room: HuyaRoom, id: Int, overlap: Bool) {
-        guard wanted, id == token else { return }
+    private func makePlayer(urlString: String, title: String) throws -> AVPlayer {
         guard let httpsURL = URL(string: urlString) else {
-            fail(id: id, reason: "音频地址无效", expired: false)
-            return
+            throw HuyaError.message("音频地址无效")
         }
-        let playURL: URL
-        do {
-            StreamProxy.shared.bumpGeneration()
-            playURL = try StreamProxy.shared.playbackURL(from: httpsURL)
-        } catch {
-            fail(id: id, reason: error.localizedDescription, expired: false)
-            return
-        }
-
-        let headers: [String: String] = HuyaAPI.playbackHeaders
-        let asset = AVURLAsset(url: playURL, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+        let playURL = try StreamProxy.shared.playbackURL(from: httpsURL)
+        let asset = AVURLAsset(url: playURL, options: ["AVURLAssetHTTPHeaderFieldsKey": HuyaAPI.playbackHeaders])
         let item = AVPlayerItem(asset: asset)
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         item.preferredForwardBufferDuration = 8
-
-        let title = room.nick.isEmpty ? room.title : room.nick
+        let next = AVPlayer(playerItem: item)
+        next.automaticallyWaitsToMinimizeStalling = true
+        next.volume = volume
         lastTitle = title.isEmpty ? nil : title
-
-        if overlap, player?.currentItem != nil {
-            beginOverlap(item: item, id: id)
-        } else {
-            replace(item: item, id: id)
-            armReadyWatchdog(id: id)
-        }
-        updateNowPlaying(title: lastTitle)
+        return next
     }
 
-    private func replace(item: AVPlayerItem, id: Int) {
-        dropOverlap()
-        teardownItem()
-        player?.pause()
-        player?.replaceCurrentItem(with: nil)
-        player = nil
-        let newPlayer = AVPlayer(playerItem: item)
-        newPlayer.automaticallyWaitsToMinimizeStalling = true
-        player = newPlayer
-        player?.volume = volume
-        observe(item: item, id: id)
-        player?.play()
+    private func swap(_ incoming: AVPlayer) -> AVPlayer? {
+        let leftover = overlapPlayer
+        overlapPlayer = player
+        player = incoming
+        leftover?.pause()
+        leftover?.replaceCurrentItem(with: nil)
+        observe(incoming)
+        return overlapPlayer
     }
 
-    private func beginOverlap(item: AVPlayerItem, id: Int) {
-        overlapItem?.cancel()
-        overlapItemObservation?.invalidate()
-        overlapPlayer?.pause()
-        overlapPlayer?.replaceCurrentItem(with: nil)
+    private var hasPlayingProcess: Bool {
+        if player?.timeControlStatus == .playing { return true }
+        if overlapPlayer?.timeControlStatus == .playing { return true }
+        return false
+    }
 
-        let incoming = AVPlayer(playerItem: item)
-        incoming.automaticallyWaitsToMinimizeStalling = true
-        incoming.volume = volume
-        overlapPlayer = incoming
-        overlapItemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-            Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                if item.status == .readyToPlay {
-                    incoming.play()
-                    self.finishOverlap(id: id)
-                } else if item.status == .failed {
-                    self.overlapItemObservation?.invalidate()
-                    self.overlapItemObservation = nil
-                    incoming.pause()
-                    self.overlapPlayer = nil
-                    if Self.isExpired(item.error) {
-                        self.handleForbidden()
-                    } else {
-                        self.onDiagnostic?(Self.describe(item.error) ?? "换链失败")
-                        self.armRefresh(id: id)
-                    }
+    private func isDead(_ target: AVPlayer?) -> Bool {
+        guard let target, let item = target.currentItem else { return true }
+        if item.status == .failed { return true }
+        if item.error != nil { return true }
+        if let events = item.errorLog()?.events {
+            for event in events {
+                if Self.looksExpired(event.errorComment ?? event.errorDomain) {
+                    return true
                 }
             }
         }
-        incoming.play()
-        overlapItem?.cancel()
-        let timeout = DispatchWorkItem { [weak self] in
-            Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                guard self.overlapPlayer === incoming else { return }
-                self.dropOverlap()
-                self.onDiagnostic?("换链超时，继续当前音频")
-                self.armRefresh(id: id)
-            }
-        }
-        overlapItem = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: timeout)
+        return false
     }
 
-    private func finishOverlap(id: Int) {
-        overlapItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
+    private func shouldStop(after seconds: TimeInterval, gen currentGen: Int) async -> Bool {
+        let ns = UInt64(max(0, seconds) * 1_000_000_000)
+        do {
+            try await Task.sleep(nanoseconds: ns)
+        } catch {
+            return true
+        }
+        return !wanted || gen != currentGen || Task.isCancelled
+    }
+
+    private func observe(_ target: AVPlayer) {
+        teardownObservers()
+        guard let item = target.currentItem else { return }
+        itemObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                guard let incoming = self.overlapPlayer else { return }
-                self.teardownItem()
-                self.player?.pause()
-                self.player?.replaceCurrentItem(with: nil)
-                self.player = incoming
-                self.overlapPlayer = nil
-                self.overlapItemObservation?.invalidate()
-                self.overlapItemObservation = nil
-                if let item = incoming.currentItem {
-                    self.observe(item: item, id: id)
+                guard let self, self.wanted, self.player === target else { return }
+                if item.status == .failed {
+                    self.currentDead = true
+                } else if item.status == .readyToPlay {
+                    self.onStatus?("音频已连接", true)
+                    self.updateNowPlaying()
                 }
-                incoming.play()
-                self.reconnectDelay = 2.5
-                self.sameLineFails = 0
-                self.resigning = false
-                self.onDiagnostic?("")
-                self.onStatus?("音频已连接", true)
-                self.armRefresh(id: id)
-                self.updateNowPlaying()
             }
         }
-        overlapItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.overlapSec, execute: work)
+        let center = NotificationCenter.default
+        failureObserver = center.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.wanted, self.player === target else { return }
+                self.currentDead = true
+            }
+        }
+        endedObserver = center.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.wanted, self.player === target else { return }
+                self.currentDead = true
+            }
+        }
+        stallObserver = center.addObserver(forName: .AVPlayerItemPlaybackStalled, object: item, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.wanted, self.player === target else { return }
+                self.player?.play()
+            }
+        }
     }
 
-    private func dropOverlap() {
-        overlapItem?.cancel()
-        overlapItem = nil
-        overlapItemObservation?.invalidate()
-        overlapItemObservation = nil
+    private func teardownObservers() {
+        itemObservation?.invalidate()
+        itemObservation = nil
+        let center = NotificationCenter.default
+        if let failureObserver { center.removeObserver(failureObserver); self.failureObserver = nil }
+        if let endedObserver { center.removeObserver(endedObserver); self.endedObserver = nil }
+        if let stallObserver { center.removeObserver(stallObserver); self.stallObserver = nil }
+    }
+
+    private func killOverlap() {
         overlapPlayer?.pause()
         overlapPlayer?.replaceCurrentItem(with: nil)
         overlapPlayer = nil
     }
 
-    private func armReadyWatchdog(id: Int) {
-        readyWatchdog?.cancel()
-        let item = DispatchWorkItem { [weak self] in
-            Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                let status = self.player?.currentItem?.status
-                if status != .readyToPlay {
-                    self.fail(id: id, reason: "音频在限定时间内未能开始播放", expired: false)
-                }
-            }
+    private func clearIfCurrent(_ target: AVPlayer?) {
+        teardownObservers()
+        if player === target {
+            player?.pause()
+            player?.replaceCurrentItem(with: nil)
+            player = nil
         }
-        readyWatchdog = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 25, execute: item)
+        if overlapPlayer === target {
+            overlapPlayer?.pause()
+            overlapPlayer?.replaceCurrentItem(with: nil)
+            overlapPlayer = nil
+        }
     }
 
-    private func armRefresh(id: Int) {
-        refreshItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in
-            Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                self.refresh()
-            }
-        }
-        refreshItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.refreshSec, execute: item)
-    }
-
-    private func fail(id: Int, reason: String, expired: Bool) {
-        guard wanted, id == token else { return }
-        if expired {
-            handleForbidden()
-            return
-        }
-        onDiagnostic?(reason)
-        token += 1
-        loadTask?.cancel()
-        loadTask = nil
-        readyWatchdog?.cancel()
-        readyWatchdog = nil
-        refreshItem?.cancel()
-        refreshItem = nil
-        dropOverlap()
-        teardownItem()
+    private func dropPlayers() {
+        teardownObservers()
         player?.pause()
         player?.replaceCurrentItem(with: nil)
-        onStatus?("音频重连中", false)
-        resigning = false
-        bumpQualityOrLine()
-        scheduleReconnect(after: reconnectDelay)
-        reconnectDelay = min(reconnectDelay * 1.5, 20)
-    }
-
-    private func bumpQualityOrLine() {
-        if let room = lastRoom, let current = currentRatio, let next = HuyaAPI.nextBitRate(in: room, after: current) {
-            currentRatio = next
-            return
-        }
-        lineIndex += 1
-        currentRatio = lastRoom?.lowestBitRate
-    }
-
-    private func scheduleReconnect(after delay: TimeInterval) {
-        guard wanted, reconnectItem == nil else { return }
-        let item = DispatchWorkItem { [weak self] in
-            Task { @MainActor in
-                guard let self, self.wanted else { return }
-                self.reconnectItem = nil
-                self.open()
-            }
-        }
-        reconnectItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
-    }
-
-    private func observe(item: AVPlayerItem, id: Int) {
-        itemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-            Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                switch item.status {
-                case .readyToPlay:
-                    self.readyWatchdog?.cancel()
-                    self.readyWatchdog = nil
-                    self.reconnectDelay = 2.5
-                    self.sameLineFails = 0
-                    self.resigning = false
-                    self.onDiagnostic?("")
-                    self.onStatus?("音频已连接", true)
-                    self.player?.play()
-                    self.armRefresh(id: id)
-                    self.updateNowPlaying()
-                case .failed:
-                    if Self.isExpired(item.error) {
-                        self.handleForbidden()
-                    } else {
-                        self.fail(id: id, reason: Self.describe(item.error) ?? "播放失败", expired: false)
-                    }
-                default:
-                    break
-                }
-            }
-        }
-        controlObservation = player?.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
-            Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                self.updateNowPlaying()
-                if player.timeControlStatus == .playing {
-                    self.readyWatchdog?.cancel()
-                    self.readyWatchdog = nil
-                    self.onStatus?("音频已连接", true)
-                }
-            }
-        }
-        let center = NotificationCenter.default
-        failureObserver = center.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main) { [weak self] note in
-            Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
-                if Self.isExpired(error) {
-                    self.handleForbidden()
-                } else {
-                    self.fail(id: id, reason: Self.describe(error) ?? "播放中断", expired: false)
-                }
-            }
-        }
-        endedObserver = center.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                self.fail(id: id, reason: "音频流结束", expired: true)
-            }
-        }
-        stallObserver = center.addObserver(forName: .AVPlayerItemPlaybackStalled, object: item, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                self.player?.play()
-            }
-        }
-        errorLogObserver = center.addObserver(forName: .AVPlayerItemNewErrorLogEntry, object: item, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.wanted, id == self.token else { return }
-                if let last = item.errorLog()?.events.last {
-                    let comment = last.errorComment ?? last.errorDomain
-                    if Self.looksExpired(comment) {
-                        self.handleForbidden()
-                    } else if !comment.isEmpty {
-                        self.onDiagnostic?(comment)
-                    }
-                }
-            }
-        }
-    }
-
-    private static func isExpired(_ error: Error?) -> Bool {
-        guard let error else { return false }
-        let ns = error as NSError
-        if ns.code == -12660 { return true }
-        if ns.code == 403 { return true }
-        return looksExpired(error.localizedDescription)
+        player = nil
+        overlapPlayer?.pause()
+        overlapPlayer?.replaceCurrentItem(with: nil)
+        overlapPlayer = nil
     }
 
     private static func looksExpired(_ text: String) -> Bool {
         let lower = text.lowercased()
-        if lower.contains("403") { return true }
-        if lower.contains("forbidden") { return true }
-        return false
+        return lower.contains("403") || lower.contains("forbidden")
     }
-
-    private static func describe(_ error: Error?) -> String? {
-        guard let error else { return nil }
-        if isExpired(error) {
-            return "直播地址过期，正在重新签名"
-        }
-        let ns = error as NSError
-        if ns.domain == "CoreMediaErrorDomain" && ns.code == -12881 {
-            return "播放器拒绝自定义地址的分片（已改为本地代理）"
-        }
-        return error.localizedDescription
-    }
-
-    private func teardownItem() {
-        itemObservation = nil
-        controlObservation = nil
-        let center = NotificationCenter.default
-        if let failureObserver { center.removeObserver(failureObserver); self.failureObserver = nil }
-        if let endedObserver { center.removeObserver(endedObserver); self.endedObserver = nil }
-        if let stallObserver { center.removeObserver(stallObserver); self.stallObserver = nil }
-        if let errorLogObserver { center.removeObserver(errorLogObserver); self.errorLogObserver = nil }
-    }
-
-    // MARK: - Session
 
     private func configureSession() {
         let session = AVAudioSession.sharedInstance()
@@ -558,6 +317,7 @@ final class AudioPlayer {
                 if type == .ended {
                     try? AVAudioSession.sharedInstance().setActive(true)
                     self.player?.play()
+                    self.updateNowPlaying()
                 }
             }
         }
@@ -567,12 +327,21 @@ final class AudioPlayer {
         guard !remoteCommandsConfigured else { return }
         remoteCommandsConfigured = true
         let center = MPRemoteCommandCenter.shared()
+        center.playCommand.isEnabled = true
+        center.pauseCommand.isEnabled = true
+        center.togglePlayPauseCommand.isEnabled = true
         center.playCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.player?.play() }
+            Task { @MainActor in
+                self?.player?.play()
+                self?.updateNowPlaying()
+            }
             return .success
         }
         center.pauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.player?.pause() }
+            Task { @MainActor in
+                self?.player?.pause()
+                self?.updateNowPlaying()
+            }
             return .success
         }
         center.togglePlayPauseCommand.addTarget { [weak self] _ in
@@ -587,9 +356,10 @@ final class AudioPlayer {
             info[MPMediaItemPropertyTitle] = title
         }
         if info[MPMediaItemPropertyTitle] == nil {
-            info[MPMediaItemPropertyTitle] = "虎牙监控"
+            info[MPMediaItemPropertyTitle] = lastTitle ?? "虎牙监控"
         }
         info[MPMediaItemPropertyArtist] = "虎牙监控"
+        info[MPNowPlayingInfoPropertyIsLiveStream] = true
         info[MPNowPlayingInfoPropertyPlaybackRate] = (player?.timeControlStatus == .playing) ? 1.0 : 0.0
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
